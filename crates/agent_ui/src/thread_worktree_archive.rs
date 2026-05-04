@@ -18,37 +18,6 @@ use workspace::{AppState, MultiWorkspace, Workspace};
 
 use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadId, ThreadMetadataStore};
 
-/// What to do when restoring a worktree finds existing content at the target
-/// path that the restore would clobber.
-///
-/// Restoration always ends with `git read-tree --reset -u`, which overwrites
-/// the working directory wholesale. Any pre-existing files at the worktree
-/// path — whether unrelated user content, a stale leftover from a partial
-/// archive, or even uncommitted work in a still-valid worktree — will be
-/// destroyed. This enum lets callers ask first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverwritePolicy {
-    /// Refuse to clobber existing content. If the worktree path has any
-    /// content, returns [`RestoreOutcome::WouldOverwrite`] without making any
-    /// changes. Callers should typically prompt the user and retry with
-    /// [`OverwritePolicy::Overwrite`] when confirmed.
-    Refuse,
-    /// Proceed with the restore, deleting any existing content at the
-    /// worktree path first.
-    Overwrite,
-}
-
-/// Outcome of [`restore_worktree_via_git`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RestoreOutcome {
-    /// The worktree was restored at this path.
-    Restored(PathBuf),
-    /// The restore was not performed because the worktree path has existing
-    /// content and the policy was [`OverwritePolicy::Refuse`]. Caller should
-    /// confirm with the user and retry with [`OverwritePolicy::Overwrite`].
-    WouldOverwrite { worktree_path: PathBuf },
-}
-
 /// The plan for archiving a single git worktree root.
 ///
 /// A thread can have multiple folder paths open, so there may be multiple
@@ -589,27 +558,19 @@ pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &m
 /// then uses [`restore_archive_checkpoint`] to reconstruct the staged/
 /// unstaged state from the WIP commit trees.
 ///
-/// The final step (`restore_archive_checkpoint`) clobbers the working
-/// directory unconditionally via `git read-tree --reset -u`, so any existing
-/// content at the worktree path would be lost. This function checks for
-/// existing content up front and refuses to proceed when `policy` is
-/// [`OverwritePolicy::Refuse`], returning [`RestoreOutcome::WouldOverwrite`]
-/// so the caller can prompt and retry with [`OverwritePolicy::Overwrite`].
+/// **Destructive**: the final step (`restore_archive_checkpoint`) clobbers the
+/// working directory unconditionally via `git read-tree --reset -u`, and this
+/// function deletes any pre-existing directory at `worktree_path` before
+/// recreating it. Callers must use [`worktree_path_has_content`] first to
+/// detect any content the user might lose, and prompt for confirmation before
+/// invoking this function.
 pub async fn restore_worktree_via_git(
     row: &ArchivedGitWorktree,
     remote_connection: Option<&RemoteConnectionOptions>,
-    policy: OverwritePolicy,
     cx: &mut AsyncApp,
-) -> Result<RestoreOutcome> {
+) -> Result<PathBuf> {
     let app_state = current_app_state(cx).context("no app state available")?;
     let worktree_path = &row.worktree_path;
-
-    let has_content = worktree_path_has_content(app_state.fs.as_ref(), worktree_path).await?;
-    if has_content && policy == OverwritePolicy::Refuse {
-        return Ok(RestoreOutcome::WouldOverwrite {
-            worktree_path: worktree_path.clone(),
-        });
-    }
 
     let (main_repo, _temp_project) =
         find_or_create_repository(&row.main_repo_path, remote_connection, cx).await?;
@@ -624,9 +585,10 @@ pub async fn restore_worktree_via_git(
     //   - Directory leftover, stale registration:       delete → prune → add.
     //   - Directory exists as a fully valid worktree:   delete → prune → add.
     //
-    // Deleting first is safe because user content at the path was already
-    // gated behind the overwrite prompt above, and the staged/unstaged WIP
-    // commits capture everything we need to restore the working tree state.
+    // Deleting first is safe because the caller is required to gate user
+    // content behind a confirmation prompt (see `worktree_path_has_content`),
+    // and the staged/unstaged WIP commits capture everything we need to
+    // restore the working tree state.
     if app_state.fs.metadata(worktree_path).await?.is_some() {
         app_state
             .fs
@@ -776,7 +738,18 @@ pub async fn restore_worktree_via_git(
         return Err(error.context("failed to restore archive checkpoint"));
     }
 
-    Ok(RestoreOutcome::Restored(worktree_path.clone()))
+    Ok(worktree_path.clone())
+}
+
+/// Returns whether restoring this archived worktree would clobber any
+/// pre-existing content on disk at the worktree's path.
+///
+/// Callers must invoke this **before** [`restore_worktree_via_git`] and prompt
+/// the user for confirmation if it returns `true`, since the restore will
+/// otherwise destroy that content.
+pub async fn restore_would_overwrite(row: &ArchivedGitWorktree, cx: &mut AsyncApp) -> Result<bool> {
+    let app_state = current_app_state(cx).context("no app state available")?;
+    worktree_path_has_content(app_state.fs.as_ref(), &row.worktree_path).await
 }
 
 /// Returns whether the worktree path has any content that a restore would
@@ -1525,64 +1498,18 @@ mod tests {
         );
     }
 
-    /// Set up a minimal main repo at /project on a `FakeFs` so a `MultiWorkspace`
-    /// can be opened. Used by the `restore_worktree_via_git` overwrite-detection
-    /// tests, which all need at least one open workspace for `current_app_state`
-    /// to succeed.
-    async fn make_main_repo(cx: &mut TestAppContext) -> (Arc<FakeFs>, Entity<MultiWorkspace>) {
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/project",
-            json!({
-                ".git": {},
-                "src": { "main.rs": "fn main() {}" }
-            }),
-        )
-        .await;
-        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
-        fs.insert_branches(Path::new("/project/.git"), &["main", "feature"]);
-
-        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
-        project
-            .update(cx, |project, cx| project.git_scans_complete(cx))
-            .await;
-
-        let multi_workspace = cx
-            .add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx))
-            .root(cx)
-            .unwrap();
-
-        cx.run_until_parked();
-
-        (fs, multi_workspace)
-    }
-
-    /// A row pointing at a worktree that doesn't have to exist for the
-    /// detection tests — those bail before opening the main repo.
-    fn archive_row_for(worktree_path: &str) -> ArchivedGitWorktree {
-        ArchivedGitWorktree {
-            id: 1,
-            worktree_path: PathBuf::from(worktree_path),
-            main_repo_path: PathBuf::from("/project"),
-            branch_name: Some("feature".to_string()),
-            staged_commit_hash: "staged-sha".to_string(),
-            unstaged_commit_hash: "unstaged-sha".to_string(),
-            original_commit_hash: "original-sha".to_string(),
-        }
-    }
-
     /// Case B (the original bug): the worktree directory exists with leftover
     /// content (e.g. files that Windows couldn't fully delete during archival
     /// because they were locked by another process), but git has no
-    /// registration for it. Restore in `Refuse` mode must surface this so the
-    /// user can be prompted before the leftover files get clobbered.
+    /// registration for it. The pre-flight check must report content so the
+    /// caller can prompt before the leftover files get clobbered.
     #[gpui::test]
-    async fn test_restore_refuse_leftover_dir_no_registration(cx: &mut TestAppContext) {
+    async fn test_has_content_leftover_dir_no_registration(cx: &mut TestAppContext) {
         init_test(cx);
-        let (fs, _multi_workspace) = make_main_repo(cx).await;
+        let fs = FakeFs::new(cx.executor());
 
         // Worktree directory has leftover content but no .git linkage and no
-        // entry in /project/.git/worktrees/.
+        // entry in any main repo's .git/worktrees/.
         fs.insert_tree(
             "/wt-orphaned",
             json!({
@@ -1591,47 +1518,28 @@ mod tests {
         )
         .await;
 
-        let row = archive_row_for("/wt-orphaned");
-        let result = cx
-            .spawn(async move |mut cx| {
-                restore_worktree_via_git(&row, None, OverwritePolicy::Refuse, &mut cx).await
-            })
-            .await;
+        let has_content = worktree_path_has_content(fs.as_ref(), Path::new("/wt-orphaned")).await;
 
         assert_eq!(
-            result.unwrap(),
-            RestoreOutcome::WouldOverwrite {
-                worktree_path: PathBuf::from("/wt-orphaned"),
-            },
-            "orphaned dir from a partial Windows archive must trigger a prompt"
+            has_content.unwrap(),
+            true,
+            "orphaned dir from a partial Windows archive must report content"
         );
         assert!(
             fs.is_file(Path::new("/wt-orphaned/leftover.txt")).await,
-            "refusing must not delete the leftover content"
+            "the check must not touch any files"
         );
     }
 
-    /// Case D: the worktree directory exists with content and the main repo's
-    /// `.git/worktrees/` has a registration for it, but the `.git` file in
-    /// the worktree itself is missing. Restore would call
-    /// `restore_archive_checkpoint`, which clobbers the working tree, so we
-    /// still need to prompt before destroying anything in the directory.
+    /// Case D: the worktree directory exists with content but the `.git` file
+    /// in the worktree itself is missing. The restore would still clobber
+    /// any user files on disk, so we must report content here.
     #[gpui::test]
-    async fn test_restore_refuse_dir_with_broken_dot_git(cx: &mut TestAppContext) {
+    async fn test_has_content_dir_with_broken_dot_git(cx: &mut TestAppContext) {
         init_test(cx);
-        let (fs, _multi_workspace) = make_main_repo(cx).await;
+        let fs = FakeFs::new(cx.executor());
 
-        fs.insert_tree(
-            "/project/.git/worktrees/feature",
-            json!({
-                "HEAD": "ref: refs/heads/feature",
-                "commondir": "../..",
-                "gitdir": "/wt-broken/.git",
-            }),
-        )
-        .await;
-        // Note: /wt-broken has files but no `.git` file — the linkage is
-        // broken even though the registration exists.
+        // /wt-broken has files but no `.git` file — the linkage is broken.
         fs.insert_tree(
             "/wt-broken",
             json!({
@@ -1640,40 +1548,24 @@ mod tests {
         )
         .await;
 
-        let row = archive_row_for("/wt-broken");
-        let result = cx
-            .spawn(async move |mut cx| {
-                restore_worktree_via_git(&row, None, OverwritePolicy::Refuse, &mut cx).await
-            })
-            .await;
+        let has_content = worktree_path_has_content(fs.as_ref(), Path::new("/wt-broken")).await;
 
         assert_eq!(
-            result.unwrap(),
-            RestoreOutcome::WouldOverwrite {
-                worktree_path: PathBuf::from("/wt-broken"),
-            },
-            "a directory with broken git linkage but real files must trigger a prompt"
+            has_content.unwrap(),
+            true,
+            "a directory with broken git linkage but real files must report content"
         );
     }
 
     /// Case E: the worktree directory is fully valid — `.git` file points back
-    /// to the main repo and the registration is intact. Even so, the restore
-    /// will overwrite any uncommitted work the user has in there via
-    /// `git read-tree --reset -u`, so we still prompt.
+    /// to the main repo. Even so, the restore will overwrite any uncommitted
+    /// work the user has in there via `git read-tree --reset -u`, so we must
+    /// still report content.
     #[gpui::test]
-    async fn test_restore_refuse_fully_valid_worktree(cx: &mut TestAppContext) {
+    async fn test_has_content_fully_valid_worktree(cx: &mut TestAppContext) {
         init_test(cx);
-        let (fs, _multi_workspace) = make_main_repo(cx).await;
+        let fs = FakeFs::new(cx.executor());
 
-        fs.insert_tree(
-            "/project/.git/worktrees/feature",
-            json!({
-                "HEAD": "ref: refs/heads/feature",
-                "commondir": "../..",
-                "gitdir": "/wt-valid/.git",
-            }),
-        )
-        .await;
         fs.insert_tree(
             "/wt-valid",
             json!({
@@ -1683,30 +1575,22 @@ mod tests {
         )
         .await;
 
-        let row = archive_row_for("/wt-valid");
-        let result = cx
-            .spawn(async move |mut cx| {
-                restore_worktree_via_git(&row, None, OverwritePolicy::Refuse, &mut cx).await
-            })
-            .await;
+        let has_content = worktree_path_has_content(fs.as_ref(), Path::new("/wt-valid")).await;
 
         assert_eq!(
-            result.unwrap(),
-            RestoreOutcome::WouldOverwrite {
-                worktree_path: PathBuf::from("/wt-valid"),
-            },
-            "a valid worktree with uncommitted work must trigger a prompt \
-             (read-tree --reset -u would clobber that work)"
+            has_content.unwrap(),
+            true,
+            "a valid worktree with uncommitted work must report content \
+             (read-tree --reset -u would clobber it)"
         );
     }
 
-    /// Case A: nothing exists at the worktree path. `Refuse` must NOT surface
-    /// a prompt — there's nothing to lose. The function may then succeed or
-    /// fail downstream depending on test setup; we only verify it didn't ask.
+    /// Case A: nothing exists at the worktree path. The check must report
+    /// no content — there's nothing to lose.
     #[gpui::test]
-    async fn test_restore_refuse_does_not_prompt_when_path_missing(cx: &mut TestAppContext) {
+    async fn test_has_content_when_path_missing(cx: &mut TestAppContext) {
         init_test(cx);
-        let (fs, _multi_workspace) = make_main_repo(cx).await;
+        let fs = FakeFs::new(cx.executor());
 
         assert!(
             fs.metadata(Path::new("/wt-missing"))
@@ -1716,64 +1600,20 @@ mod tests {
             "precondition: worktree path must not exist"
         );
 
-        let row = archive_row_for("/wt-missing");
-        let result = cx
-            .spawn(async move |mut cx| {
-                restore_worktree_via_git(&row, None, OverwritePolicy::Refuse, &mut cx).await
-            })
-            .await;
+        let has_content = worktree_path_has_content(fs.as_ref(), Path::new("/wt-missing")).await;
 
-        assert!(
-            !matches!(result, Ok(RestoreOutcome::WouldOverwrite { .. })),
-            "missing dir must not trigger a prompt: got {:?}",
-            result
+        assert_eq!(
+            has_content.unwrap(),
+            false,
+            "missing dir must not report content"
         );
     }
 
-    /// Case C: registration exists in the main repo but the working
-    /// directory was already removed (either by a successful archive or by
-    /// the user manually). Nothing on disk to lose, so `Refuse` must NOT
-    /// surface a prompt.
+    /// An empty directory at the worktree path has no content to lose.
     #[gpui::test]
-    async fn test_restore_refuse_does_not_prompt_when_registration_only(cx: &mut TestAppContext) {
+    async fn test_has_content_for_empty_dir(cx: &mut TestAppContext) {
         init_test(cx);
-        let (fs, _multi_workspace) = make_main_repo(cx).await;
-
-        // Stale registration for a worktree whose working dir is gone.
-        fs.insert_tree(
-            "/project/.git/worktrees/feature",
-            json!({
-                "HEAD": "ref: refs/heads/feature",
-                "commondir": "../..",
-                "gitdir": "/wt-stale/.git",
-            }),
-        )
-        .await;
-        assert!(
-            fs.metadata(Path::new("/wt-stale")).await.unwrap().is_none(),
-            "precondition: worktree path must not exist on disk"
-        );
-
-        let row = archive_row_for("/wt-stale");
-        let result = cx
-            .spawn(async move |mut cx| {
-                restore_worktree_via_git(&row, None, OverwritePolicy::Refuse, &mut cx).await
-            })
-            .await;
-
-        assert!(
-            !matches!(result, Ok(RestoreOutcome::WouldOverwrite { .. })),
-            "stale registration with no on-disk content must not trigger a prompt: got {:?}",
-            result
-        );
-    }
-
-    /// An empty directory at the worktree path has no content to lose, so
-    /// `Refuse` must NOT surface a prompt.
-    #[gpui::test]
-    async fn test_restore_refuse_does_not_prompt_for_empty_dir(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (fs, _multi_workspace) = make_main_repo(cx).await;
+        let fs = FakeFs::new(cx.executor());
 
         fs.create_dir(Path::new("/wt-empty")).await.unwrap();
         assert!(
@@ -1781,17 +1621,12 @@ mod tests {
             "precondition: empty dir must exist"
         );
 
-        let row = archive_row_for("/wt-empty");
-        let result = cx
-            .spawn(async move |mut cx| {
-                restore_worktree_via_git(&row, None, OverwritePolicy::Refuse, &mut cx).await
-            })
-            .await;
+        let has_content = worktree_path_has_content(fs.as_ref(), Path::new("/wt-empty")).await;
 
-        assert!(
-            !matches!(result, Ok(RestoreOutcome::WouldOverwrite { .. })),
-            "empty dir must not trigger a prompt: got {:?}",
-            result
+        assert_eq!(
+            has_content.unwrap(),
+            false,
+            "empty dir must not report content"
         );
     }
 }

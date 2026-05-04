@@ -589,23 +589,30 @@ pub async fn restore_worktree_via_git(
     // content behind a confirmation prompt (see `worktree_path_has_content`),
     // and the staged/unstaged WIP commits capture everything we need to
     // restore the working tree state.
-    if app_state.fs.metadata(worktree_path).await?.is_some() {
-        app_state
-            .fs
-            .remove_dir(
-                worktree_path,
-                RemoveOptions {
-                    recursive: true,
-                    ignore_if_not_exists: true,
-                },
+    if let Some(metadata) = app_state.fs.metadata(worktree_path).await? {
+        let remove_options = RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: true,
+        };
+        // The path is normally a directory, but a stray regular file (or
+        // symlink) can happen if something went wrong in a previous archive
+        // or the user manually replaced the worktree. `remove_dir` would
+        // fail with ENOTDIR in that case, so dispatch on the actual entry
+        // type.
+        let result = if metadata.is_dir {
+            app_state.fs.remove_dir(worktree_path, remove_options).await
+        } else {
+            app_state
+                .fs
+                .remove_file(worktree_path, remove_options)
+                .await
+        };
+        result.with_context(|| {
+            format!(
+                "failed to delete existing worktree path '{}'",
+                worktree_path.display()
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to delete existing worktree directory '{}'",
-                    worktree_path.display()
-                )
-            })?;
+        })?;
     }
 
     // Prune any stale registration in the main repo that points at the (now

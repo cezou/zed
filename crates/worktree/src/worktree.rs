@@ -3020,7 +3020,8 @@ impl LocalSnapshot {
 
 impl BackgroundScannerState {
     fn should_scan_directory(&self, entry: &Entry) -> bool {
-        (self.scanning_enabled && !entry.is_external && (!entry.is_ignored || entry.is_always_included))
+        (self.scanning_enabled && !entry.is_external
+            && (!entry.is_ignored || entry.is_always_included))
             || entry.path.file_name() == Some(DOT_GIT)
             || entry.path.file_name() == Some(local_settings_folder_name())
             || entry.path.file_name() == Some(local_vscode_folder_name())
@@ -3048,6 +3049,7 @@ impl BackgroundScannerState {
             .map(|entry| (entry.id, entry.path.clone()))
             .collect::<Vec<_>>();
         entries.sort_unstable_by_key(|(entry_id, _)| *entry_id);
+        entries.dedup_by_key(|(entry_id, _)| *entry_id);
         if entries.is_empty() {
             self.next_scanned_dir_poll_index = 0;
             return None;
@@ -4279,7 +4281,18 @@ impl BackgroundScanner {
                 }
 
                 _ = poll_scanned_dirs_timer => {
-                    self.poll_scanned_dirs().await;
+                    if let Some(directory_paths) = self.state.lock().await.next_scanned_dir_poll_paths() {
+                        self.process_scan_request(
+                            ScanRequest {
+                                relative_paths: Vec::new(),
+                                directory_paths,
+                                done: SmallVec::new(),
+                            },
+                            false,
+                        )
+                        .await;
+                    }
+
                     poll_scanned_dirs_timer.set(self.poll_scanned_dirs_timer().fuse());
                 }
 
@@ -4290,22 +4303,6 @@ impl BackgroundScanner {
                 }
             }
         }
-    }
-
-    async fn poll_scanned_dirs(&self) {
-        let Some(directory_paths) = self.state.lock().await.next_scanned_dir_poll_paths() else {
-            return;
-        };
-
-        self.process_scan_request(
-            ScanRequest {
-                relative_paths: Vec::new(),
-                directory_paths,
-                done: SmallVec::new(),
-            },
-            false,
-        )
-        .await;
     }
 
     async fn process_scan_request(&self, mut request: ScanRequest, scanning: bool) -> bool {
@@ -6708,20 +6705,16 @@ fn decode_byte_full(
 mod tests {
     use super::*;
 
-    fn test_metadata(is_dir: bool, inode: u64) -> fs::Metadata {
-        fs::Metadata {
-            inode,
+    fn insert_test_entry(snapshot: &mut Snapshot, id: ProjectEntryId, path: Arc<RelPath>) {
+        let metadata = fs::Metadata {
+            inode: id.to_usize() as u64,
             mtime: MTime::from_seconds_and_nanos(0, 0),
             is_symlink: false,
-            is_dir,
+            is_dir: true,
             len: 0,
             is_fifo: false,
             is_executable: false,
-        }
-    }
-
-    fn insert_test_entry(snapshot: &mut Snapshot, id: ProjectEntryId, path: Arc<RelPath>) {
-        let metadata = test_metadata(true, id.to_usize() as u64);
+        };
         let mut entry = Entry::new(path, &metadata, id, snapshot.root_char_bag, None);
         entry.kind = EntryKind::Dir;
         snapshot

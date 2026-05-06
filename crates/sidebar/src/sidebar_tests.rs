@@ -11795,3 +11795,225 @@ async fn test_cmd_click_project_header_returns_to_last_active_linked_worktree_wo
          linked-worktree workspace was the last-active one for the group"
     );
 }
+
+#[gpui::test]
+async fn test_restore_worktree_refuses_overwrite_when_content_exists(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-refuse": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-refuse",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/wt-feature-refuse",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-refuse",
+            "src": { "existing.rs": "// user's existing work" },
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/wt-feature-refuse"),
+            ref_name: Some("refs/heads/feature-refuse".into()),
+            sha: "original-sha".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project =
+        project::Project::test(fs.clone(), ["/wt-feature-refuse".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, _cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    multi_workspace.update_in(_cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    let worktree_repo = worktree_project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+    let (staged_hash, unstaged_hash) = cx
+        .update(|cx| worktree_repo.update(cx, |repo, _| repo.create_archive_checkpoint()))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let result = cx
+        .spawn(|mut cx| async move {
+            agent_ui::thread_worktree_archive::restore_worktree_via_git(
+                &agent_ui::thread_metadata_store::ArchivedGitWorktree {
+                    id: 1,
+                    worktree_path: PathBuf::from("/wt-feature-refuse"),
+                    main_repo_path: PathBuf::from("/project"),
+                    branch_name: Some("feature-refuse".to_string()),
+                    staged_commit_hash: staged_hash,
+                    unstaged_commit_hash: unstaged_hash,
+                    original_commit_hash: "original-sha".to_string(),
+                },
+                None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Refuse,
+                &mut cx,
+            )
+            .await
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "restore should fail with Refuse policy when content exists"
+    );
+    let error_message = format!("{:#}", result.unwrap_err());
+    assert!(
+        error_message.contains("existing content"),
+        "error should mention existing content, got: {error_message}"
+    );
+
+    let existing_content = fs
+        .load(Path::new("/wt-feature-refuse/src/existing.rs"))
+        .await
+        .expect("existing file must still be present");
+    assert_eq!(existing_content, "// user's existing work");
+}
+
+#[gpui::test]
+async fn test_restore_worktree_refuse_allows_when_path_is_empty(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-empty": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-empty",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/wt-feature-empty",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-empty",
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/wt-feature-empty"),
+            ref_name: Some("refs/heads/feature-empty".into()),
+            sha: "original-sha".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project =
+        project::Project::test(fs.clone(), ["/wt-feature-empty".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, _cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    multi_workspace.update_in(_cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    let worktree_repo = worktree_project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+    let (staged_hash, unstaged_hash) = cx
+        .update(|cx| worktree_repo.update(cx, |repo, _| repo.create_archive_checkpoint()))
+        .await
+        .unwrap()
+        .unwrap();
+
+    fs.remove_dir(
+        Path::new("/wt-feature-empty"),
+        fs::RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        fs.metadata(Path::new("/wt-feature-empty"))
+            .await
+            .unwrap()
+            .is_none(),
+        "precondition: worktree directory must not exist"
+    );
+
+    let result = cx
+        .spawn(|mut cx| async move {
+            agent_ui::thread_worktree_archive::restore_worktree_via_git(
+                &agent_ui::thread_metadata_store::ArchivedGitWorktree {
+                    id: 1,
+                    worktree_path: PathBuf::from("/wt-feature-empty"),
+                    main_repo_path: PathBuf::from("/project"),
+                    branch_name: Some("feature-empty".to_string()),
+                    staged_commit_hash: staged_hash,
+                    unstaged_commit_hash: unstaged_hash,
+                    original_commit_hash: "original-sha".to_string(),
+                },
+                None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Refuse,
+                &mut cx,
+            )
+            .await
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "restore with Refuse should succeed when worktree path does not exist: {:?}",
+        result.err()
+    );
+
+    assert!(
+        fs.metadata(Path::new("/wt-feature-empty"))
+            .await
+            .unwrap()
+            .is_some(),
+        "worktree path should exist after a successful restore"
+    );
+}

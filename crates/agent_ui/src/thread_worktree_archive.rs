@@ -993,9 +993,11 @@ async fn worktree_path_has_content(fs: &dyn Fs, path: &Path) -> Result<bool> {
         return Ok(false);
     };
 
+    if metadata.is_symlink {
+        return Ok(true);
+    }
+
     if !metadata.is_dir {
-        // A regular file (or symlink, etc.) at this path is unusual for a
-        // worktree path, so treat it as content to avoid silently losing it.
         return Ok(true);
     }
 

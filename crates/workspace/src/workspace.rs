@@ -5952,9 +5952,16 @@ impl Workspace {
     ) {
         cx.emit(Event::ActiveItemChanged);
         let active_entry = self.active_project_path(cx);
-        self.project.update(cx, |project, cx| {
-            project.set_active_path(active_entry.clone(), cx)
-        });
+        // Items whose own `project_path` is `None` while still being active
+        // (multi-buffer wrappers like the diagnostics view) rely on their
+        // inner editor publishing the cursor's buffer directly. Don't clobber
+        // that here on unrelated tab events; only clear when there is truly
+        // no active item.
+        if active_entry.is_some() || self.active_item(cx).is_none() {
+            self.project.update(cx, |project, cx| {
+                project.set_active_path(active_entry.clone(), cx)
+            });
+        }
 
         if focus_changed && let Some(project_path) = &active_entry {
             let git_store_entity = self.project.read(cx).git_store().clone();

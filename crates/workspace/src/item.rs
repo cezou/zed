@@ -237,6 +237,22 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
         ItemBufferKind::None
     }
+
+    /// The project path that should be highlighted in the project panel and
+    /// tracked by LSP/git for this item. The default returns the underlying
+    /// project item's path for singletons (regular file editors, image
+    /// viewers, notebooks, etc.) and `None` otherwise. Multi-buffer-backed
+    /// items override this to follow the buffer under the primary cursor.
+    fn project_path(&self, cx: &App) -> Option<ProjectPath> {
+        if self.buffer_kind(cx) != ItemBufferKind::Singleton {
+            return None;
+        }
+        let mut result = None;
+        self.for_each_project_item(cx, &mut |_, item| {
+            result = item.project_path(cx);
+        });
+        result
+    }
     fn set_nav_history(&mut self, _: ItemNavHistory, _window: &mut Window, _: &mut Context<Self>) {}
 
     fn can_split(&self) -> bool {
@@ -646,14 +662,7 @@ impl<T: Item> ItemHandle for Entity<T> {
     }
 
     fn project_path(&self, cx: &App) -> Option<ProjectPath> {
-        let this = self.read(cx);
-        let mut result = None;
-        if this.buffer_kind(cx) == ItemBufferKind::Singleton {
-            this.for_each_project_item(cx, &mut |_, item| {
-                result = item.project_path(cx);
-            });
-        }
-        result
+        <T as Item>::project_path(self.read(cx), cx)
     }
 
     fn workspace_settings<'a>(&self, cx: &'a App) -> &'a WorkspaceSettings {

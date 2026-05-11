@@ -2510,6 +2510,9 @@ impl Editor {
             &cx.entity(),
             window,
             |editor, _, e: &EditorEvent, window, cx| match e {
+                EditorEvent::SelectionsChanged { local: true } | EditorEvent::Focused => {
+                    editor.publish_active_project_path(cx);
+                }
                 EditorEvent::ScrollPositionChanged { local, .. } => {
                     if *local {
                         editor.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
@@ -3138,6 +3141,24 @@ impl Editor {
 
     pub fn project(&self) -> Option<&Entity<Project>> {
         self.project.as_ref()
+    }
+
+    fn publish_active_project_path(&self, cx: &mut Context<Self>) {
+        if !self.mode.is_full() {
+            return;
+        }
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let Some(path) = self
+            .active_buffer(cx)
+            .and_then(|buffer| buffer.read(cx).project_path(cx))
+        else {
+            return;
+        };
+        project.update(cx, |project, cx| {
+            project.set_active_path(Some(path), cx);
+        });
     }
 
     pub fn workspace(&self) -> Option<Entity<Workspace>> {

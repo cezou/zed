@@ -493,33 +493,86 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
-    /// Threads currently being restored from archive. Tracked globally so
-    /// only one window at a time can run the destructive restore for a
-    /// given thread; other windows surface a toast instead. Per-window
-    /// `restoring_tasks` state still exists in `Sidebar`, this is the
-    /// cross-window claim layer in front of it.
-    restoring: HashSet<ThreadId>,
-    restoring_paths: HashSet<PathBuf>,
+    /// Restores currently in flight. Tracked globally so only one window
+    /// at a time can run the destructive restore for a given thread or
+    /// target the same on-disk worktree path; other windows surface a
+    /// toast instead. Per-window `restoring_tasks` state still exists in
+    /// `Sidebar`; this is the cross-window claim layer in front of it.
+    active_restores: ActiveRestores,
     _db_operations_task: Task<()>,
 }
 
+/// Tracks the set of restores currently in flight across all windows.
+///
+/// Two distinct invariants need to be enforced:
+///
+/// 1. **Per-thread**: only one window at a time may restore a given thread,
+///    even when the thread has no archived worktrees on disk (so we can
+///    still serialize the "open thread" side of the flow).
+/// 2. **Per-path**: only one restore at a time may touch a given worktree
+///    path on disk, even if two different threads happen to reference the
+///    same path (e.g. two archived threads sharing a worktree directory).
+///
+/// The relationship is many-to-many (one thread → many paths, one path →
+/// many threads), so these can't collapse to a single map. Bundling them
+/// behind a single `try_claim` / `release` API keeps the two invariants in
+/// sync; callers can't accidentally claim one without the other.
+#[derive(Default)]
+struct ActiveRestores {
+    by_thread: HashMap<ThreadId, Vec<PathBuf>>,
+    /// Derived index of every path appearing in any value of `by_thread`,
+    /// kept in sync by `try_claim` / `release`. Lets the collision check
+    /// stay O(paths-in-this-claim) instead of scanning every in-flight
+    /// restore.
+    paths_in_use: HashSet<PathBuf>,
+}
+
+impl ActiveRestores {
+    /// Attempts to register a new restore for `thread_id` holding `paths`.
+    /// Returns `false` (and leaves `self` unchanged) if `thread_id` is
+    /// already restoring, or if any path in `paths` is already claimed by
+    /// another in-flight restore.
+    fn try_claim(&mut self, thread_id: ThreadId, paths: Vec<PathBuf>) -> bool {
+        if self.by_thread.contains_key(&thread_id) {
+            return false;
+        }
+        if paths.iter().any(|p| self.paths_in_use.contains(p)) {
+            return false;
+        }
+        for path in &paths {
+            self.paths_in_use.insert(path.clone());
+        }
+        self.by_thread.insert(thread_id, paths);
+        true
+    }
+
+    fn release(&mut self, thread_id: ThreadId) {
+        if let Some(paths) = self.by_thread.remove(&thread_id) {
+            for path in paths {
+                self.paths_in_use.remove(&path);
+            }
+        }
+    }
+
+    fn is_restoring(&self, thread_id: ThreadId) -> bool {
+        self.by_thread.contains_key(&thread_id)
+    }
+}
+
 /// RAII guard returned by [`ThreadMetadataStore::try_claim_restore`]. When
-/// dropped, schedules a `finish_restoring` call on the global store so the
-/// claim is released even on early returns or panics.
+/// dropped, releases the claim on the global store so the lock is freed
+/// even on early returns or panics.
 pub struct RestoreGuard {
     thread_id: ThreadId,
-    paths: Vec<PathBuf>,
     store: WeakEntity<ThreadMetadataStore>,
     cx: gpui::AsyncApp,
 }
 
 impl Drop for RestoreGuard {
     fn drop(&mut self) {
-        let paths = std::mem::take(&mut self.paths);
         self.store
             .update(&mut self.cx, |store, _| {
-                store.finish_restoring(self.thread_id);
-                store.finish_restoring_paths(&paths);
+                store.active_restores.release(self.thread_id);
             })
             .ok();
     }
@@ -591,43 +644,16 @@ impl ThreadMetadataStore {
         cx.global::<GlobalThreadMetadataStore>().0.clone()
     }
 
-    /// Tries to mark `thread_id` as currently being restored. Returns `true`
-    /// if the claim was newly registered, `false` if some other window is
-    /// already restoring this thread. Caller MUST eventually call
-    /// `finish_restoring` (use [`RestoreGuard`] to make this automatic).
-    pub fn begin_restoring(&mut self, thread_id: ThreadId) -> bool {
-        self.restoring.insert(thread_id)
-    }
-
-    pub fn finish_restoring(&mut self, thread_id: ThreadId) {
-        self.restoring.remove(&thread_id);
-    }
-
     pub fn is_restoring(&self, thread_id: ThreadId) -> bool {
-        self.restoring.contains(&thread_id)
+        self.active_restores.is_restoring(thread_id)
     }
 
-    pub fn begin_restoring_paths(&mut self, paths: &[PathBuf]) -> bool {
-        if paths.iter().any(|p| self.restoring_paths.contains(p)) {
-            return false;
-        }
-        for path in paths {
-            self.restoring_paths.insert(path.clone());
-        }
-        true
-    }
-
-    pub fn finish_restoring_paths(&mut self, paths: &[PathBuf]) {
-        for path in paths {
-            self.restoring_paths.remove(path);
-        }
-    }
-
-    /// Attempts to claim exclusive ownership of restoring `thread_id`. If
-    /// some other caller already holds a claim, returns `None` — the caller
-    /// should surface a "this thread is already being restored in another
-    /// window" message to the user. On success, the returned guard releases
-    /// the claim when dropped.
+    /// Attempts to claim exclusive ownership of restoring `thread_id`,
+    /// which will touch the on-disk worktrees at `paths`. If some other
+    /// caller already holds a claim on this thread, or on any of the given
+    /// paths, returns `None` — the caller should surface a "this thread is
+    /// already being restored in another window" message to the user. On
+    /// success, the returned guard releases the claim when dropped.
     pub fn try_claim_restore(
         this: &Entity<Self>,
         thread_id: ThreadId,
@@ -635,21 +661,13 @@ impl ThreadMetadataStore {
         cx: &mut gpui::AsyncApp,
     ) -> Option<RestoreGuard> {
         let claimed = this.update(cx, |store, _| {
-            if !store.begin_restoring(thread_id) {
-                return false;
-            }
-            if !store.begin_restoring_paths(&paths) {
-                store.finish_restoring(thread_id);
-                return false;
-            }
-            true
+            store.active_restores.try_claim(thread_id, paths)
         });
         if !claimed {
             return None;
         }
         Some(RestoreGuard {
             thread_id,
-            paths,
             store: this.downgrade(),
             cx: cx.clone(),
         })
@@ -1273,8 +1291,7 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
-            restoring: HashSet::default(),
-            restoring_paths: HashSet::default(),
+            active_restores: ActiveRestores::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);

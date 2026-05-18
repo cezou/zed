@@ -598,6 +598,7 @@ mod tests {
             tool_permissions,
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
+            group_by_worktree: false,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
         }

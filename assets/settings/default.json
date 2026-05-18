@@ -1185,6 +1185,13 @@
     //
     // Default: true
     "expand_terminal_card": true,
+    // When true, the Agent panel sidebar cascades git worktrees under each
+    // project group: one row per worktree with its threads nested below.
+    // When false, Zed's default layout is used (worktrees accessed via the
+    // project header's overflow menu).
+    //
+    // Default: false
+    "group_by_worktree": false,
     // How thinking blocks should be displayed by default in the agent panel.
     //
     // Default: auto

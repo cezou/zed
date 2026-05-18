@@ -200,6 +200,13 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_merge_conflict_indicator: Option<bool>,
+    /// Whether the Agent panel sidebar should cascade git worktrees under each
+    /// project group (one row per worktree, threads nested below). When false,
+    /// the sidebar keeps Zed's default layout where worktrees are accessed via
+    /// the project header's overflow menu.
+    ///
+    /// Default: false
+    pub group_by_worktree: Option<bool>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

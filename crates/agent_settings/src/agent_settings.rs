@@ -167,6 +167,7 @@ pub struct AgentSettings {
     pub message_editor_min_lines: usize,
     pub show_turn_stats: bool,
     pub show_merge_conflict_indicator: bool,
+    pub group_by_worktree: bool,
     pub tool_permissions: ToolPermissions,
 }
 
@@ -671,6 +672,7 @@ impl Settings for AgentSettings {
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
+            group_by_worktree: agent.group_by_worktree.unwrap_or(false),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
         }
     }

@@ -200,6 +200,19 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_merge_conflict_indicator: Option<bool>,
+    /// Whether the Agent panel sidebar should list local Claude Code CLI
+    /// sessions (stored under `~/.claude/projects/`) as a dedicated section.
+    /// Clicking a session opens a terminal that resumes it via
+    /// `claude_code_command -r <session-id>` in the session's recorded cwd.
+    ///
+    /// Default: false
+    pub show_claude_code_sessions: Option<bool>,
+    /// Command used to launch / resume Claude Code CLI sessions when the
+    /// `show_claude_code_sessions` feature is enabled. Resolved against
+    /// `$PATH` if it's a bare name, or used as-is if it's a path.
+    ///
+    /// Default: "claude"
+    pub claude_code_command: Option<String>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

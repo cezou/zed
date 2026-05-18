@@ -167,6 +167,8 @@ pub struct AgentSettings {
     pub message_editor_min_lines: usize,
     pub show_turn_stats: bool,
     pub show_merge_conflict_indicator: bool,
+    pub show_claude_code_sessions: bool,
+    pub claude_code_command: Arc<str>,
     pub tool_permissions: ToolPermissions,
 }
 
@@ -671,6 +673,12 @@ impl Settings for AgentSettings {
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
+            show_claude_code_sessions: agent.show_claude_code_sessions.unwrap_or(false),
+            claude_code_command: agent
+                .claude_code_command
+                .as_deref()
+                .unwrap_or("claude")
+                .into(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
         }
     }

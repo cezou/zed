@@ -598,6 +598,8 @@ mod tests {
             tool_permissions,
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
+            show_claude_code_sessions: false,
+            claude_code_command: "claude".into(),
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
         }

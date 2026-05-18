@@ -1185,6 +1185,18 @@
     //
     // Default: true
     "expand_terminal_card": true,
+    // When true, the Agent panel sidebar lists local Claude Code CLI
+    // sessions (stored under `~/.claude/projects/`) as a dedicated
+    // section. Clicking a session opens a terminal that resumes it via
+    // `claude_code_command -r <session-id>` in the session's recorded cwd.
+    //
+    // Default: false
+    "show_claude_code_sessions": false,
+    // Command used to launch / resume Claude Code CLI sessions when the
+    // `show_claude_code_sessions` feature is enabled.
+    //
+    // Default: "claude"
+    "claude_code_command": "claude",
     // How thinking blocks should be displayed by default in the agent panel.
     //
     // Default: auto

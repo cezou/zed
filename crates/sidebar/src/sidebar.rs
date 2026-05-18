@@ -273,6 +273,12 @@ enum ListEntry {
         waiting_thread_count: usize,
         is_active: bool,
         has_threads: bool,
+        /// When `Some`, this header is a worktree sub-header rendered under
+        /// its parent project (cascade mode). The string is the worktree
+        /// label to display in place of the project label. The `key` still
+        /// points at the parent project so existing navigation/active-state
+        /// logic keeps working.
+        worktree_sub_label: Option<SharedString>,
     },
     Thread(ThreadEntry),
     Terminal(TerminalEntry),
@@ -1264,6 +1270,8 @@ impl Sidebar {
             }
         }
 
+        let group_by_worktree = AgentSettings::get_global(cx).group_by_worktree;
+
         for group in &groups {
             let group_key = &group.key;
             let group_workspaces = &group.workspaces;
@@ -1666,6 +1674,7 @@ impl Sidebar {
                     waiting_thread_count,
                     is_active,
                     has_threads,
+                    worktree_sub_label: None,
                 });
 
                 Self::push_entries_by_display_time(
@@ -1674,6 +1683,7 @@ impl Sidebar {
                     matched_threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                    group_by_worktree.then_some(group_key.clone()),
                 );
             } else {
                 project_header_indices.push(entries.len());
@@ -1685,6 +1695,7 @@ impl Sidebar {
                     waiting_thread_count,
                     is_active,
                     has_threads,
+                    worktree_sub_label: None,
                 });
 
                 if is_collapsed {
@@ -1697,6 +1708,7 @@ impl Sidebar {
                     threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                    group_by_worktree.then_some(group_key.clone()),
                 );
             }
         }
@@ -1823,6 +1835,7 @@ impl Sidebar {
                 waiting_thread_count,
                 is_active: is_active_group,
                 has_threads,
+                worktree_sub_label,
             } => {
                 let has_active_draft = is_active
                     && self
@@ -1836,12 +1849,18 @@ impl Sidebar {
                                     || panel.active_conversation_view().is_none())
                         });
                 self.project_header_menu_handles.entry(ix).or_default();
+                let display_label = worktree_sub_label.as_ref().unwrap_or(label);
+                let display_highlights: &[usize] = if worktree_sub_label.is_some() {
+                    &[]
+                } else {
+                    highlight_positions
+                };
                 self.render_project_header(
                     ix,
                     false,
                     key,
-                    label,
-                    highlight_positions,
+                    display_label,
+                    display_highlights,
                     *has_running_threads,
                     *waiting_thread_count,
                     *is_active_group,
@@ -4712,6 +4731,7 @@ impl Sidebar {
         threads: Vec<ThreadEntry>,
         current_session_ids: &mut HashSet<acp::SessionId>,
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
+        group_by_worktree_key: Option<ProjectGroupKey>,
     ) {
         fn display_time(entry: &ListEntry) -> DateTime<Utc> {
             match entry {
@@ -4721,11 +4741,111 @@ impl Sidebar {
             }
         }
 
-        let row_entries = terminals
+        /// Primary worktree of an entry, used to bucket rows under per-worktree
+        /// sub-headers when `group_by_worktree` is enabled.
+        fn primary_worktree(entry: &ListEntry) -> Option<&ThreadItemWorktreeInfo> {
+            match entry {
+                ListEntry::Thread(t) => t.worktrees.first(),
+                ListEntry::Terminal(t) => t.worktrees.first(),
+                ListEntry::ProjectHeader { .. } => None,
+            }
+        }
+
+        fn worktree_bucket_key(entry: &ListEntry) -> Option<SharedString> {
+            primary_worktree(entry).map(|w| w.full_path.clone())
+        }
+
+        fn worktree_label(info: &ThreadItemWorktreeInfo) -> SharedString {
+            match (&info.worktree_name, &info.branch_name) {
+                (Some(name), Some(branch)) if name != branch => {
+                    SharedString::from(format!("{name} ({branch})"))
+                }
+                (Some(name), _) => name.clone(),
+                (None, Some(branch)) => branch.clone(),
+                (None, None) => info.full_path.clone(),
+            }
+        }
+
+        let mut row_entries: Vec<ListEntry> = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
-            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)))
+            .collect();
+
+        if let Some(key) = group_by_worktree_key {
+            // Bucket entries by primary worktree path while preserving the
+            // already-applied time ordering within each bucket. Buckets are
+            // emitted in the order they are first encountered (i.e. the
+            // bucket whose newest entry is newest comes first).
+            let mut bucket_order: Vec<Option<SharedString>> = Vec::new();
+            let mut buckets: HashMap<Option<SharedString>, Vec<ListEntry>> = HashMap::new();
+            for entry in row_entries.drain(..) {
+                let bucket = worktree_bucket_key(&entry);
+                if !buckets.contains_key(&bucket) {
+                    bucket_order.push(bucket.clone());
+                }
+                buckets.entry(bucket).or_default().push(entry);
+            }
+            for bucket in bucket_order {
+                if let Some(_) = bucket.as_ref() {
+                    // Emit a worktree sub-header. We derive its label from
+                    // the first entry's worktree info; the bucket key is the
+                    // full_path so all entries in the bucket share the same
+                    // ThreadItemWorktreeInfo.full_path.
+                    let label = buckets
+                        .get(&bucket)
+                        .and_then(|rows| rows.first())
+                        .and_then(primary_worktree)
+                        .map(worktree_label)
+                        .unwrap_or_else(|| SharedString::from(""));
+                    let has_running = buckets
+                        .get(&bucket)
+                        .map(|rows| {
+                            rows.iter().any(|e| matches!(
+                                e,
+                                ListEntry::Thread(t)
+                                    if t.is_live && t.status == AgentThreadStatus::Running
+                            ))
+                        })
+                        .unwrap_or(false);
+                    let waiting = buckets
+                        .get(&bucket)
+                        .map(|rows| {
+                            rows.iter()
+                                .filter(|e| matches!(
+                                    e,
+                                    ListEntry::Thread(t)
+                                        if t.is_live
+                                            && t.status
+                                                == AgentThreadStatus::WaitingForConfirmation
+                                ))
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    entries.push(ListEntry::ProjectHeader {
+                        key: key.clone(),
+                        label: label.clone(),
+                        highlight_positions: Vec::new(),
+                        has_running_threads: has_running,
+                        waiting_thread_count: waiting,
+                        is_active: false,
+                        has_threads: true,
+                        worktree_sub_label: Some(label),
+                    });
+                }
+                for entry in buckets.remove(&bucket).into_iter().flatten() {
+                    if let ListEntry::Thread(thread) = &entry {
+                        if let Some(session_id) = &thread.metadata.session_id {
+                            current_session_ids.insert(session_id.clone());
+                        }
+                        current_thread_ids.insert(thread.metadata.thread_id);
+                    }
+                    entries.push(entry);
+                }
+            }
+            return;
+        }
 
         for entry in row_entries {
             if let ListEntry::Thread(thread) = &entry {

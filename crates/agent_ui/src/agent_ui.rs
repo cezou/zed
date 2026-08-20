@@ -32,6 +32,7 @@ pub mod test_support;
 mod thread_import;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
+pub mod ticket_metadata_store;
 
 pub mod threads_archive_view;
 mod ui;
@@ -191,6 +192,7 @@ pub enum AgentThreadSource {
     AgentPanel,
     GitPanel,
     Sidebar,
+    TicketPanel,
 }
 
 impl AgentThreadSource {
@@ -199,6 +201,7 @@ impl AgentThreadSource {
             Self::AgentPanel => "agent_panel",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
+            Self::TicketPanel => "ticket_panel",
         }
     }
 }
@@ -617,6 +620,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    ticket_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

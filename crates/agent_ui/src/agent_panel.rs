@@ -42,6 +42,9 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     terminal_title_without_prefix,
 };
+use crate::ticket_metadata_store::{
+    TicketId, TicketLaunchKind, TicketMetadataStore, TicketSessionRecord,
+};
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
@@ -180,6 +183,12 @@ impl fmt::Display for TerminalId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+/// POSIX single-quotes `value` for safe use as one shell argument (embedded
+/// single quotes are closed, escaped, and reopened: `'\''`).
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[derive(Clone, Debug)]
@@ -1004,6 +1013,13 @@ struct AgentTerminal {
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
+    /// The command line typed into this terminal at spawn time, if any
+    /// (see `spawn_terminal`'s `initial_command` parameter). Persisted so a
+    /// later respawn (`restore_terminal`) can decide what to re-run.
+    initial_command: Option<String>,
+    /// The `claude` CLI session id this terminal is running, if it was
+    /// launched via the ticket panel.
+    cc_session_id: Option<String>,
 }
 
 impl AgentTerminal {
@@ -1976,6 +1992,8 @@ impl AgentPanel {
             None,
             None,
             None,
+            None,
+            None,
             true,
             true,
             true,
@@ -2030,6 +2048,8 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
+        initial_command: Option<String>,
+        cc_session_id: Option<String>,
         select: bool,
         focus: bool,
         run_init_command: bool,
@@ -2079,6 +2099,8 @@ impl AgentPanel {
                     custom_title,
                     initial_title,
                     created_at,
+                    initial_command,
+                    cc_session_id,
                     select,
                     focus,
                     source,
@@ -2163,6 +2185,8 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
+        initial_command: Option<String>,
+        cc_session_id: Option<String>,
         select: bool,
         focus: bool,
         source: AgentThreadSource,
@@ -2175,6 +2199,15 @@ impl AgentPanel {
             });
         }
         let terminal_entity = terminal_view.read(cx).terminal().clone();
+        if let Some(command) = initial_command.as_ref() {
+            // Queued bytes sit in the PTY's input buffer until the shell's
+            // readline loop reads them, so writing immediately (rather than
+            // waiting for a ready/Wakeup signal) is safe even if the shell's
+            // own rc-file banner is still printing.
+            let mut bytes = command.clone().into_bytes();
+            bytes.push(b'\n');
+            terminal_entity.update(cx, |terminal, _cx| terminal.input(bytes));
+        }
         let view_subscription = cx.subscribe(
             &terminal_view,
             move |this, _terminal_view, event: &ItemEvent, cx| match event {
@@ -2225,6 +2258,8 @@ impl AgentPanel {
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
             _subscriptions: vec![view_subscription, terminal_subscription],
+            initial_command,
+            cc_session_id,
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
@@ -2395,6 +2430,8 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            initial_command: terminal.initial_command.clone(),
+            cc_session_id: terminal.cc_session_id.clone(),
         })
     }
 
@@ -2419,12 +2456,21 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(metadata.terminal_id);
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
+        // Only a terminal that was previously launched with a captured `claude`
+        // session id gets a resume command on respawn; a plain agent-panel
+        // terminal restore continues to open a blank shell exactly as before.
+        let resume_command = metadata
+            .cc_session_id
+            .as_ref()
+            .map(|id| format!("claude --resume {id}"));
         self.spawn_terminal(
             metadata.terminal_id,
             working_directory,
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
+            resume_command,
+            metadata.cc_session_id.clone(),
             true,
             focus,
             true,
@@ -2470,6 +2516,69 @@ impl AgentPanel {
 
     fn terminal_restore_initial_title(metadata: &TerminalThreadMetadata) -> Option<SharedString> {
         (!metadata.title.is_empty()).then(|| metadata.title.clone())
+    }
+
+    /// Launches a `claude` CLI session for a ticket: mints a fresh terminal
+    /// id and session id, records the session in `TicketMetadataStore`
+    /// *before* spawning (so a crash mid-launch still leaves a resumable
+    /// record), then spawns the terminal with the launch command as its
+    /// initial input.
+    pub fn spawn_ticket_terminal(
+        &mut self,
+        ticket_id: TicketId,
+        launch_kind: TicketLaunchKind,
+        seeded_message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = TicketMetadataStore::try_global(cx) else {
+            return;
+        };
+        let Some(worktree_path) = store
+            .read(cx)
+            .entry(&ticket_id)
+            .and_then(|entry| entry.worktree_path.clone())
+        else {
+            log::error!("spawn_ticket_terminal: ticket {ticket_id:?} has no worktree yet");
+            return;
+        };
+
+        let terminal_id = TerminalId::new();
+        let cc_session_id = uuid::Uuid::new_v4().to_string();
+        let command = format!(
+            "claude --session-id {cc_session_id} --permission-mode plan {}",
+            shell_quote(&seeded_message)
+        );
+
+        let session = TicketSessionRecord {
+            terminal_id,
+            cc_session_id: Some(cc_session_id.clone()),
+            launch_kind,
+            created_at: Utc::now(),
+            last_resumed_at: None,
+            ended_at: None,
+        };
+        if let Err(error) =
+            store.update(cx, |store, cx| store.add_session(&ticket_id, session, cx))
+        {
+            log::error!("failed to record ticket session for {ticket_id:?}: {error:#}");
+            return;
+        }
+
+        self.spawn_terminal(
+            terminal_id,
+            Some(worktree_path),
+            None,
+            None,
+            None,
+            Some(command),
+            Some(cc_session_id),
+            true,
+            true,
+            AgentThreadSource::TicketPanel,
+            window,
+            cx,
+        );
     }
 
     fn edit_terminal_title(
@@ -6773,6 +6882,8 @@ impl AgentPanel {
             custom_title,
             initial_title,
             created_at,
+            None,
+            None,
             select,
             focus,
             source,
@@ -9729,6 +9840,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
+            cc_session_id: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -9780,6 +9893,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
+            cc_session_id: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {

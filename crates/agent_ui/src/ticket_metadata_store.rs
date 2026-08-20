@@ -21,7 +21,7 @@ use ui::{App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::{AppState, MultiWorkspace, OpenOptions, OpenResult, Workspace};
 
-use crate::terminal_thread_metadata_store::{TerminalThreadMetadata, TerminalThreadMetadataStore};
+use crate::terminal_thread_metadata_store::TerminalThreadMetadataStore;
 use crate::{AgentPanel, AgentThreadSource, TerminalId};
 
 pub fn init(cx: &mut App) {
@@ -139,11 +139,15 @@ enum DbOperation {
 impl DbOperation {
     /// Distinguishes operations for dedup purposes: two ops with the same key
     /// are collapsed to just the most recent one when flushing a batch.
+    /// `UpsertWorktree` and `DeleteWorktree` share a key (both act on the same
+    /// `ticket_worktrees` row) so a delete can never be reordered after a
+    /// stale upsert of the same ticket within one flush — HashMap iteration
+    /// order for the deduped set is otherwise unspecified.
     fn dedup_key(&self) -> (u8, String) {
         match self {
             DbOperation::UpsertWorktree(row) => (0, row.ticket_id.0.to_string()),
             DbOperation::UpsertSession { session, .. } => (1, session.terminal_id.to_key_string()),
-            DbOperation::DeleteWorktree(ticket_id) => (2, ticket_id.0.to_string()),
+            DbOperation::DeleteWorktree(ticket_id) => (0, ticket_id.0.to_string()),
         }
     }
 }

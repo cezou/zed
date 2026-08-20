@@ -2058,7 +2058,9 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = initial_command
+            .clone()
+            .or_else(|| Self::terminal_init_command(run_init_command, cx));
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2199,15 +2201,6 @@ impl AgentPanel {
             });
         }
         let terminal_entity = terminal_view.read(cx).terminal().clone();
-        if let Some(command) = initial_command.as_ref() {
-            // Queued bytes sit in the PTY's input buffer until the shell's
-            // readline loop reads them, so writing immediately (rather than
-            // waiting for a ready/Wakeup signal) is safe even if the shell's
-            // own rc-file banner is still printing.
-            let mut bytes = command.clone().into_bytes();
-            bytes.push(b'\n');
-            terminal_entity.update(cx, |terminal, _cx| terminal.input(bytes));
-        }
         let view_subscription = cx.subscribe(
             &terminal_view,
             move |this, _terminal_view, event: &ItemEvent, cx| match event {
@@ -2573,6 +2566,7 @@ impl AgentPanel {
             None,
             Some(command),
             Some(cc_session_id),
+            true,
             true,
             true,
             AgentThreadSource::TicketPanel,
@@ -5238,6 +5232,8 @@ impl AgentPanel {
             None,
             None,
             None,
+            None,
+            None,
             true,
             false,
             true,
@@ -7620,6 +7616,8 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
+            cc_session_id: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7704,6 +7702,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
+            cc_session_id: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -7787,6 +7787,8 @@ mod tests {
                 terminal_id,
                 // No working directory: the FakeFs project path doesn't exist on
                 // the real filesystem the shell process runs against.
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -7877,6 +7879,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
+            cc_session_id: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {

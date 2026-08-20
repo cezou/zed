@@ -11668,6 +11668,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "notion_client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18791,6 +18806,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickets_panel"
+version = "0.1.0"
+dependencies = [
+ "agent_ui",
+ "anyhow",
+ "editor",
+ "gpui",
+ "log",
+ "menu",
+ "notion_client",
+ "settings",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "tiff"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23332,6 +23365,7 @@ dependencies = [
  "theme_extension",
  "theme_selector",
  "theme_settings",
+ "tickets_panel",
  "time",
  "time_format",
  "title_bar",

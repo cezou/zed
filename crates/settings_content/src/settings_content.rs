@@ -268,6 +268,8 @@ pub struct SettingsContent {
 
     pub project_panel: Option<ProjectPanelSettingsContent>,
 
+    pub tickets_panel: Option<TicketsPanelSettingsContent>,
+
     /// Configuration for Node-related features
     pub node: Option<NodeBinarySettings>,
 
@@ -1165,6 +1167,55 @@ pub struct OutlinePanelSettingsContent {
     ///
     /// Default: 100
     pub expand_outlines_with_depth: Option<usize>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct TicketsPanelSettingsContent {
+    /// The position of the tickets panel.
+    ///
+    /// Default: right
+    pub dock: Option<DockSide>,
+    /// Customize default width (in pixels) taken by the tickets panel.
+    ///
+    /// Default: 300
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub default_width: Option<f32>,
+    /// Notion database id for the ticket board, resolved once via the
+    /// "notion: Resolve Database" command from a page id/URL.
+    ///
+    /// Default: null
+    pub notion_database_id: Option<String>,
+    /// Resolved Notion user id (UUID) used to filter tickets assigned to you.
+    /// Populated automatically by "notion: Resolve Database".
+    ///
+    /// Default: null
+    pub notion_assignee_user_id: Option<String>,
+    /// Exact status option strings (as they appear in the live Notion
+    /// schema, including any emoji/numbering) to include in the ticket list.
+    /// Populated by "notion: Resolve Database"; edit if it guesses wrong.
+    ///
+    /// Default: []
+    pub notion_status_filter: Option<Vec<String>>,
+    /// Name of the status property as discovered in the database schema
+    /// (e.g. "Status").
+    ///
+    /// Default: null
+    pub notion_status_property: Option<String>,
+    /// Name of the assignee (people) property as discovered in the database
+    /// schema (e.g. "Assignee").
+    ///
+    /// Default: null
+    pub notion_assignee_property: Option<String>,
+    /// How often to refresh the ticket list from Notion, in seconds.
+    ///
+    /// Default: 300
+    pub refresh_interval_secs: Option<u64>,
+    /// Absolute path to the main worktree of the repository new ticket
+    /// worktrees are cut from.
+    ///
+    /// Default: null
+    pub repo_path: Option<String>,
 }
 
 #[derive(

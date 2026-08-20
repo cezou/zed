@@ -203,6 +203,7 @@ theme.workspace = true
 theme_extension.workspace = true
 theme_selector.workspace = true
 theme_settings.workspace = true
+tickets_panel.workspace = true
 time.workspace = true
 time_format.workspace = true
 title_bar.workspace = true

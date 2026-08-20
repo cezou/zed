@@ -988,6 +988,30 @@
     // Set to 0 to collapse all items that have children, 1 or higher to collapse items at that depth or deeper.
     "expand_outlines_with_depth": 100,
   },
+  "tickets_panel": {
+    // Where to dock the tickets panel. Can be 'left' or 'right'.
+    "dock": "right",
+    // Default width of the tickets panel.
+    "default_width": 300,
+    // Notion database id for the ticket board, resolved once via the
+    // "notion: Resolve Database" command from a page id/URL.
+    "notion_database_id": null,
+    // Resolved Notion user id (UUID) used to filter tickets assigned to you.
+    // Populated automatically by "notion: Resolve Database".
+    "notion_assignee_user_id": null,
+    // Exact status option strings (as they appear in the live Notion
+    // schema, including any emoji/numbering) to include in the ticket list.
+    "notion_status_filter": [],
+    // Name of the status property as discovered in the database schema.
+    "notion_status_property": null,
+    // Name of the assignee (people) property as discovered in the database schema.
+    "notion_assignee_property": null,
+    // How often to refresh the ticket list from Notion, in seconds.
+    "refresh_interval_secs": 300,
+    // Absolute path to the main worktree of the repository new ticket
+    // worktrees are cut from.
+    "repo_path": null,
+  },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
     "button": true,

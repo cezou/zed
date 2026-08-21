@@ -142,6 +142,10 @@ Other entities can then register a callback to handle these events by doing `cx.
 - Under WSL/remote X11 sandboxes with broken GPU passthrough (window renders solid black, stderr shows `DRI3 error`), force X11 instead of Wayland: `env -u WAYLAND_DISPLAY DISPLAY=:0 ./target/debug/zed`.
 - If it then blocks on an "Unsupported GPU" dialog (software-emulated GPU detected), set `ZED_ALLOW_EMULATED_GPU=1` to skip it.
 
+## Agent-driven UI testing (screenshots, clicking)
+
+- Under WSL, Zed's GPU-composited window can't be captured by X11 screenshot tools (comes back solid black), and no input-simulation tool is available there. For any task that needs an agent to click UI elements and/or take screenshots to verify a change, run from native Windows PowerShell instead and use the `run-zed` skill (`.claude/skills/run-zed/SKILL.md`), which drives Zed through UI Automation (backed by GPUI's AccessKit tree) rather than blind pixel coordinates.
+
 # Pull request hygiene
 
 When an agent opens or updates a pull request, it must:

@@ -216,7 +216,7 @@ members = [
     "crates/theme_importer",
     "crates/theme_selector",
     "crates/theme_settings",
-    "crates/tickets_panel",
+    "crates/ticket_sync",
     "crates/time_format",
     "crates/title_bar",
     "crates/toolchain_selector",
@@ -482,7 +482,7 @@ theme = { path = "crates/theme" }
 theme_extension = { path = "crates/theme_extension" }
 theme_selector = { path = "crates/theme_selector" }
 theme_settings = { path = "crates/theme_settings" }
-tickets_panel = { path = "crates/tickets_panel" }
+ticket_sync = { path = "crates/ticket_sync" }
 time_format = { path = "crates/time_format" }
 title_bar = { path = "crates/title_bar" }
 toolchain_selector = { path = "crates/toolchain_selector" }

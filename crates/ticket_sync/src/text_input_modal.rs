@@ -92,14 +92,12 @@ impl Render for TextInputModal {
                     .gap_2()
                     .px(DynamicSpacing::Base12.rems(cx))
                     .pb(DynamicSpacing::Base08.rems(cx))
-                    .child(
-                        Button::new("cancel", "Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.cancel(&menu::Cancel, window, cx))),
-                    )
-                    .child(
-                        Button::new("confirm", "Confirm")
-                            .on_click(cx.listener(|this, _, window, cx| this.confirm(&menu::Confirm, window, cx))),
-                    ),
+                    .child(Button::new("cancel", "Cancel").on_click(
+                        cx.listener(|this, _, window, cx| this.cancel(&menu::Cancel, window, cx)),
+                    ))
+                    .child(Button::new("confirm", "Confirm").on_click(
+                        cx.listener(|this, _, window, cx| this.confirm(&menu::Confirm, window, cx)),
+                    )),
             )
     }
 }

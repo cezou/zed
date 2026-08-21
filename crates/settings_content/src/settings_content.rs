@@ -1216,6 +1216,27 @@ pub struct TicketsPanelSettingsContent {
     ///
     /// Default: null
     pub repo_path: Option<String>,
+    /// Notion data source url (`collection://<uuid>`) for the ticket board,
+    /// resolved via the OAuth/MCP connection ("notion: Connect to Notion")
+    /// when Personal Access Tokens aren't permitted in your workspace.
+    ///
+    /// Default: null
+    pub notion_data_source_url: Option<String>,
+    /// Name of the title-type property (the ticket's own name/heading), as
+    /// discovered over OAuth/MCP.
+    ///
+    /// Default: null
+    pub notion_title_property: Option<String>,
+    /// Name of the person-type property used to filter tickets assigned to
+    /// you, as discovered from the configured view (e.g. "Tech").
+    ///
+    /// Default: null
+    pub notion_person_property: Option<String>,
+    /// Name of the Notion view (e.g. "Team Board") whose status filter
+    /// should be mirrored when discovering the board over OAuth/MCP.
+    ///
+    /// Default: "Team Board"
+    pub notion_board_view_name: Option<String>,
 }
 
 #[derive(

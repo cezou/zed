@@ -13,6 +13,10 @@ pub struct TicketsPanelSettings {
     pub notion_assignee_property: Option<String>,
     pub refresh_interval_secs: u64,
     pub repo_path: Option<String>,
+    pub notion_data_source_url: Option<String>,
+    pub notion_title_property: Option<String>,
+    pub notion_person_property: Option<String>,
+    pub notion_board_view_name: String,
 }
 
 impl Settings for TicketsPanelSettings {
@@ -28,6 +32,13 @@ impl Settings for TicketsPanelSettings {
             notion_assignee_property: panel.notion_assignee_property.clone(),
             refresh_interval_secs: panel.refresh_interval_secs.unwrap(),
             repo_path: panel.repo_path.clone(),
+            notion_data_source_url: panel.notion_data_source_url.clone(),
+            notion_title_property: panel.notion_title_property.clone(),
+            notion_person_property: panel.notion_person_property.clone(),
+            notion_board_view_name: panel
+                .notion_board_view_name
+                .clone()
+                .unwrap_or_else(|| "Team Board".to_string()),
         }
     }
 }

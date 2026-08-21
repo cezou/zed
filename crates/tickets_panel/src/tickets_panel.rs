@@ -3,6 +3,7 @@ pub mod tickets_panel_settings;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_ui::ticket_metadata_store::{
@@ -13,7 +14,11 @@ use gpui::{
     IntoElement, ParentElement, Render, SharedString, Styled, Task, WeakEntity, Window, actions,
     div, uniform_list,
 };
-use notion_client::{DatabaseSchema, NotionClient, TicketRef, token_store};
+use http_client::HttpClient;
+use notion_client::mcp::McpClient;
+use notion_client::mcp_board::McpBoardConfig;
+use notion_client::oauth::OAuthTokens;
+use notion_client::{DatabaseSchema, NotionClient, TicketRef, oauth, oauth_store, token_store};
 use settings::Settings as _;
 use ui::{
     Button, ButtonCommon, Chip, Clickable, Color, IconButton, IconName, InteractiveElement, Label,
@@ -36,6 +41,11 @@ actions!(
         /// assignee user id, and status/assignee property names, writing the
         /// results back into settings.
         ResolveDatabase,
+        /// Connects to Notion via OAuth against its public MCP server, for
+        /// workspaces whose admin policy blocks Personal Access Token and
+        /// Connection creation. Discovers the configured board's schema over
+        /// MCP once connected.
+        ConnectToNotion,
     ]
 );
 
@@ -66,6 +76,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|_workspace, _: &ResolveDatabase, window, cx| {
             open_resolve_database_modal(window, cx);
+        });
+        workspace.register_action(|_workspace, _: &ConnectToNotion, window, cx| {
+            open_connect_to_notion_modal(window, cx);
         });
     })
     .detach();
@@ -166,6 +179,92 @@ fn resolve_database(page_input: String, cx: &mut App) {
     .detach();
 }
 
+fn open_connect_to_notion_modal(window: &mut Window, cx: &mut Context<Workspace>) {
+    cx.defer_in(window, |workspace, window, cx| {
+        workspace.toggle_modal(window, cx, |window, cx| {
+            TextInputModal::new(
+                "Connect to Notion",
+                "Notion page or database URL/id",
+                None,
+                false,
+                |page_input, _window, cx| {
+                    connect_to_notion(page_input, cx);
+                },
+                window,
+                cx,
+            )
+        });
+    });
+}
+
+/// Runs the OAuth flow against Notion's public MCP server, stores the
+/// resulting tokens, then discovers the configured board's schema (data
+/// source, status/person/title properties, and the status values the named
+/// view filters to) and the caller's own Notion user id, writing everything
+/// back into settings. Used instead of [`resolve_database`] when the
+/// workspace doesn't permit Personal Access Token/Connection creation.
+fn connect_to_notion(page_input: String, cx: &mut App) {
+    let http_client = cx.http_client();
+    let fs = AppState::try_global(cx).map(|state| state.fs.clone());
+    let view_name = TicketsPanelSettings::get_global(cx)
+        .notion_board_view_name
+        .clone();
+    cx.spawn(async move |cx| {
+        let oauth_task = cx.update(|cx| oauth::run_oauth_flow(http_client.clone(), cx));
+        let tokens = match oauth_task.await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                log::error!("connect_to_notion: OAuth flow failed: {error}");
+                return;
+            }
+        };
+        let store_task = cx.update(|cx| oauth_store::store_tokens(&tokens, cx));
+        if let Err(error) = store_task.await {
+            log::error!("connect_to_notion: failed to store OAuth tokens: {error}");
+        }
+
+        let mut client = McpClient::new(http_client, tokens);
+        if let Err(error) = client.initialize().await {
+            log::error!("connect_to_notion: MCP initialize failed: {error}");
+            return;
+        }
+
+        let page_id = extract_page_id(&page_input);
+        let board = match notion_client::mcp_board::discover_board(&mut client, &page_id, &view_name).await
+        {
+            Ok(board) => board,
+            Err(error) => {
+                log::error!("connect_to_notion: failed to discover board: {error}");
+                return;
+            }
+        };
+        let self_user_id = match notion_client::mcp_board::resolve_self_user_id(&mut client).await {
+            Ok(id) => id,
+            Err(error) => {
+                log::error!("connect_to_notion: failed to resolve self user id: {error}");
+                return;
+            }
+        };
+
+        let Some(fs) = fs else {
+            log::error!("connect_to_notion: no AppState available to write settings back");
+            return;
+        };
+        cx.update(|cx| {
+            settings::update_settings_file(fs, cx, move |settings, _cx| {
+                let panel = settings.tickets_panel.get_or_insert_default();
+                panel.notion_data_source_url = Some(board.data_source_url);
+                panel.notion_title_property = Some(board.title_property);
+                panel.notion_person_property = Some(board.person_property);
+                panel.notion_status_property = Some(board.status_property);
+                panel.notion_status_filter = Some(board.status_values);
+                panel.notion_assignee_user_id = Some(self_user_id);
+            });
+        });
+    })
+    .detach();
+}
+
 /// Notion page URLs embed the 32-hex-character page id at the very end of
 /// the last path segment's slug (with the title's own words/dashes stripped
 /// out ahead of it, e.g. `.../My-Page-Title-0123456789abcdef0123456789abcdef`) —
@@ -248,77 +347,21 @@ impl TicketsPanel {
 
     fn start_refresh(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let settings = TicketsPanelSettings::get_global(cx).clone();
-        let Some(database_id) = settings.notion_database_id.clone() else {
-            self.load_status = LoadStatus::NoDatabase;
-            return;
-        };
-        let (Some(assignee_user_id), Some(status_property), Some(assignee_property)) = (
-            settings.notion_assignee_user_id.clone(),
-            settings.notion_status_property.clone(),
-            settings.notion_assignee_property.clone(),
-        ) else {
-            self.load_status = LoadStatus::NoDatabase;
-            return;
-        };
-        let status_options = settings.notion_status_filter.clone();
-        let schema = DatabaseSchema {
-            status_property,
-            status_property_kind: notion_client::StatusPropertyKind::Status,
-            status_options: status_options.clone(),
-            assignee_property,
-        };
         let interval = Duration::from_secs(settings.refresh_interval_secs.max(30));
         let http_client = cx.http_client();
 
         self.load_status = LoadStatus::Loading;
         let panel = cx.entity().downgrade();
         self._refresh_task = cx.spawn(async move |_this, cx| {
-            let token_task = cx.update(|cx| token_store::load_token(cx));
-            let Some(token) = token_task.await else {
-                panel
-                    .update(cx, |panel, cx| {
-                        panel.load_status = LoadStatus::NoToken;
-                        cx.notify();
-                    })
-                    .ok();
-                return;
-            };
-
-            let client = NotionClient::new(http_client, token);
-            loop {
-                let result = client
-                    .query_tickets(&database_id, &schema, &assignee_user_id, &status_options)
-                    .await;
-                let updated = panel
-                    .update(cx, |panel, cx| {
-                        match result {
-                            Ok(tickets) => {
-                                for ticket in &tickets {
-                                    if let Some(store) = TicketMetadataStore::try_global(cx) {
-                                        store.update(cx, |store, cx| {
-                                            store.upsert_ticket_ref(
-                                                TicketId::new(ticket.page_id.clone()),
-                                                ticket.title.clone().into(),
-                                                ticket.url.clone().into(),
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                }
-                                panel.tickets = tickets;
-                                panel.load_status = LoadStatus::Loaded;
-                            }
-                            Err(error) => {
-                                panel.load_status = LoadStatus::Error(error.to_string().into());
-                            }
-                        }
-                        cx.notify();
-                    })
-                    .is_ok();
-                if !updated {
-                    break;
-                }
-                cx.background_executor().timer(interval).await;
+            // OAuth is preferred when both credentials happen to be
+            // configured — it's the path that's been empirically verified
+            // against a workspace where Personal Access Tokens are blocked
+            // by admin policy, so it's the safer default to trust.
+            let oauth_tokens = cx.update(|cx| oauth_store::load_tokens(cx)).await;
+            if let Some(tokens) = oauth_tokens {
+                refresh_loop_mcp(panel, http_client, tokens, settings, interval, cx).await;
+            } else {
+                refresh_loop_rest(panel, http_client, settings, interval, cx).await;
             }
         });
     }
@@ -604,6 +647,171 @@ impl TicketsPanel {
                     ),
             )
             .end_slot(end_slot)
+    }
+}
+
+async fn refresh_loop_rest(
+    panel: WeakEntity<TicketsPanel>,
+    http_client: Arc<dyn HttpClient>,
+    settings: TicketsPanelSettings,
+    interval: Duration,
+    cx: &mut AsyncApp,
+) {
+    let Some(database_id) = settings.notion_database_id.clone() else {
+        panel
+            .update(cx, |panel, cx| {
+                panel.load_status = LoadStatus::NoDatabase;
+                cx.notify();
+            })
+            .ok();
+        return;
+    };
+    let (Some(assignee_user_id), Some(status_property), Some(assignee_property)) = (
+        settings.notion_assignee_user_id.clone(),
+        settings.notion_status_property.clone(),
+        settings.notion_assignee_property.clone(),
+    ) else {
+        panel
+            .update(cx, |panel, cx| {
+                panel.load_status = LoadStatus::NoDatabase;
+                cx.notify();
+            })
+            .ok();
+        return;
+    };
+    let status_options = settings.notion_status_filter.clone();
+    let schema = DatabaseSchema {
+        status_property,
+        status_property_kind: notion_client::StatusPropertyKind::Status,
+        status_options: status_options.clone(),
+        assignee_property,
+    };
+
+    let token_task = cx.update(|cx| token_store::load_token(cx));
+    let Some(token) = token_task.await else {
+        panel
+            .update(cx, |panel, cx| {
+                panel.load_status = LoadStatus::NoToken;
+                cx.notify();
+            })
+            .ok();
+        return;
+    };
+
+    let client = NotionClient::new(http_client, token);
+    loop {
+        let result = client
+            .query_tickets(&database_id, &schema, &assignee_user_id, &status_options)
+            .await;
+        let updated = panel
+            .update(cx, |panel, cx| {
+                match result {
+                    Ok(tickets) => {
+                        upsert_tickets_into_store(&tickets, cx);
+                        panel.tickets = tickets;
+                        panel.load_status = LoadStatus::Loaded;
+                    }
+                    Err(error) => {
+                        panel.load_status = LoadStatus::Error(error.to_string().into());
+                    }
+                }
+                cx.notify();
+            })
+            .is_ok();
+        if !updated {
+            break;
+        }
+        cx.background_executor().timer(interval).await;
+    }
+}
+
+async fn refresh_loop_mcp(
+    panel: WeakEntity<TicketsPanel>,
+    http_client: Arc<dyn HttpClient>,
+    mut tokens: OAuthTokens,
+    settings: TicketsPanelSettings,
+    interval: Duration,
+    cx: &mut AsyncApp,
+) {
+    let (Some(data_source_url), Some(title_property), Some(person_property), Some(status_property)) = (
+        settings.notion_data_source_url.clone(),
+        settings.notion_title_property.clone(),
+        settings.notion_person_property.clone(),
+        settings.notion_status_property.clone(),
+    ) else {
+        panel
+            .update(cx, |panel, cx| {
+                panel.load_status = LoadStatus::NoDatabase;
+                cx.notify();
+            })
+            .ok();
+        return;
+    };
+    let Some(person_id) = settings.notion_assignee_user_id.clone() else {
+        panel
+            .update(cx, |panel, cx| {
+                panel.load_status = LoadStatus::NoDatabase;
+                cx.notify();
+            })
+            .ok();
+        return;
+    };
+    let config = McpBoardConfig {
+        data_source_url,
+        title_property,
+        status_property,
+        status_values: settings.notion_status_filter.clone(),
+        person_property,
+    };
+
+    loop {
+        let mut client = McpClient::new(http_client.clone(), tokens.clone());
+        let result = async {
+            client.initialize().await?;
+            notion_client::mcp_board::query_tickets(&mut client, &config, &person_id).await
+        }
+        .await;
+        if let Some(refreshed) = client.refreshed_tokens() {
+            tokens = refreshed.clone();
+            let store_task = cx.update(|cx| oauth_store::store_tokens(&tokens, cx));
+            store_task.await.log_err();
+        }
+
+        let updated = panel
+            .update(cx, |panel, cx| {
+                match result {
+                    Ok(tickets) => {
+                        upsert_tickets_into_store(&tickets, cx);
+                        panel.tickets = tickets;
+                        panel.load_status = LoadStatus::Loaded;
+                    }
+                    Err(error) => {
+                        panel.load_status = LoadStatus::Error(error.to_string().into());
+                    }
+                }
+                cx.notify();
+            })
+            .is_ok();
+        if !updated {
+            break;
+        }
+        cx.background_executor().timer(interval).await;
+    }
+}
+
+fn upsert_tickets_into_store(tickets: &[TicketRef], cx: &mut App) {
+    let Some(store) = TicketMetadataStore::try_global(cx) else {
+        return;
+    };
+    for ticket in tickets {
+        store.update(cx, |store, cx| {
+            store.upsert_ticket_ref(
+                TicketId::new(ticket.page_id.clone()),
+                ticket.title.clone().into(),
+                ticket.url.clone().into(),
+                cx,
+            );
+        });
     }
 }
 

@@ -1011,6 +1011,19 @@
     // Absolute path to the main worktree of the repository new ticket
     // worktrees are cut from.
     "repo_path": null,
+    // Notion data source url (collection://<uuid>), resolved via
+    // "notion: Connect to Notion" (OAuth/MCP) when Personal Access Tokens
+    // aren't permitted in your workspace.
+    "notion_data_source_url": null,
+    // Name of the title-type property (the ticket's own name/heading), as
+    // discovered over OAuth/MCP.
+    "notion_title_property": null,
+    // Name of the person-type property used to filter tickets assigned to
+    // you, as discovered from the configured view.
+    "notion_person_property": null,
+    // Name of the Notion view whose status filter should be mirrored when
+    // discovering the board over OAuth/MCP.
+    "notion_board_view_name": "Team Board",
   },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.

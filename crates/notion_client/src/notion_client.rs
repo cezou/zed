@@ -12,6 +12,11 @@ use http_client::{AsyncBody, HttpClient, Method, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod mcp;
+pub mod mcp_board;
+pub mod oauth;
+pub mod oauth_store;
+
 const NOTION_API_BASE: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2022-06-28";
 const NOTION_CREDENTIALS_URL: &str = "https://api.notion.com";
@@ -526,7 +531,7 @@ fn joined_plain_text(rich_text: &[Value]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-fn slugify(title: &str) -> String {
+pub(crate) fn slugify(title: &str) -> String {
     let mut slug = String::with_capacity(title.len());
     let mut last_was_dash = false;
     for ch in title.chars() {

@@ -15,10 +15,11 @@ use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
     fuzzy_match_positions,
 };
+use agent_ui::ticket_metadata_store::{TicketId, TicketMetadataStore, TicketWorktreeRecord};
 use agent_ui::{
-    AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadSource,
-    ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewTerminalThread,
-    NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
+    AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo,
+    AgentThreadSource, ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE,
+    NewTerminalThread, NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
     ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
 };
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
@@ -41,13 +42,15 @@ use menu::{
 use notifications::status_toast::StatusToast;
 use project::{AgentId, AgentRegistryStore, Event as ProjectEvent, WorktreeId};
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
-use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{
+    RemoteConnectionOptions, remote_connection_identity, same_remote_connection_identity,
+};
 use ui::utils::platform_title_bar_height;
 
 use serde::{Deserialize, Serialize};
 use settings::Settings as _;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -56,8 +59,8 @@ use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TicketItem, TicketSessionState, TintColor,
+    Tooltip, WithScrollbar, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -101,6 +104,8 @@ gpui::actions!(
     ]
 );
 
+const READY_FOR_DEV_SECTION_LABEL: &str = "Ready for Dev";
+
 const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
@@ -125,6 +130,11 @@ struct SerializedSidebar {
     width: Option<f32>,
     #[serde(default)]
     active_view: SerializedSidebarView,
+    /// Notion page ids of the tickets whose session rows are revealed.
+    #[serde(default)]
+    expanded_tickets: Vec<String>,
+    #[serde(default)]
+    collapsed_ticket_sections: Vec<TicketSectionKey>,
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +200,9 @@ impl ActiveEntry {
             }
             (ActiveEntry::Terminal { terminal_id, .. }, ListEntry::Terminal(terminal)) => {
                 *terminal_id == terminal.metadata.terminal_id
+            }
+            (ActiveEntry::Terminal { terminal_id, .. }, ListEntry::TicketSession(session)) => {
+                *terminal_id == session.metadata.terminal_id
             }
             _ => false,
         }
@@ -388,6 +401,84 @@ impl ThreadEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Notion ticket rows. Kept as one contiguous block so upstream rebases of this
+// file touch a single region rather than a dozen scattered definitions.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum TicketSectionKey {
+    /// Ticket worktrees whose base repo is not an open project group in this window.
+    Repo {
+        root: PathBuf,
+        host: Option<RemoteConnectionOptions>,
+    },
+    /// Tickets with no worktree yet.
+    ReadyForDev,
+}
+
+impl TicketSectionKey {
+    /// A total order for the unopened-repo sections. `RemoteConnectionOptions`
+    /// is not `Ord`, so its identity is rendered to a string to key the
+    /// `BTreeMap` that fixes section order across rebuilds.
+    fn sort_key(&self) -> (PathBuf, String) {
+        match self {
+            TicketSectionKey::Repo { root, host } => (
+                root.clone(),
+                host.as_ref()
+                    .map(|host| format!("{:?}", remote_connection_identity(host)))
+                    .unwrap_or_default(),
+            ),
+            TicketSectionKey::ReadyForDev => (PathBuf::new(), String::new()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TicketEntry {
+    record: Arc<TicketWorktreeRecord>,
+    worktree_label: Option<SharedString>,
+    session_state: TicketSessionState,
+    sessions: Vec<TicketSessionEntry>,
+    highlight_positions: Vec<usize>,
+    has_notification: bool,
+}
+
+#[derive(Clone)]
+struct TicketSessionEntry {
+    ticket_id: TicketId,
+    metadata: TerminalThreadMetadata,
+    workspace: ThreadEntryWorkspace,
+    is_live: bool,
+    last_active_at: DateTime<Utc>,
+    has_notification: bool,
+    highlight_positions: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct TicketSectionHeaderEntry {
+    key: TicketSectionKey,
+    label: SharedString,
+    ticket_count: usize,
+    has_running_sessions: bool,
+    has_notifications: bool,
+}
+
+/// Tickets bucketed by where their rows belong, produced in a single pass over
+/// the ticket store before the project-group loop runs.
+#[derive(Default)]
+struct TicketBuckets {
+    by_group: HashMap<ProjectGroupKey, Vec<TicketEntry>>,
+    /// Keyed by [`TicketSectionKey::sort_key`] so section order is stable.
+    unopened_repos: BTreeMap<(PathBuf, String), (TicketSectionKey, Vec<TicketEntry>)>,
+    ready_for_dev: Vec<TicketEntry>,
+    /// Every terminal that belongs to a ticket session, expanded or not. The
+    /// project-group loop uses this to avoid emitting those terminals a second
+    /// time as plain `ListEntry::Terminal` rows.
+    session_terminal_ids: HashSet<TerminalId>,
+    notified_session_terminal_ids: HashSet<TerminalId>,
+}
+
 #[derive(Clone)]
 enum ListEntry {
     ProjectHeader {
@@ -402,6 +493,9 @@ enum ListEntry {
     },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
+    TicketSectionHeader(TicketSectionHeaderEntry),
+    Ticket(Arc<TicketEntry>),
+    TicketSession(TicketSessionEntry),
 }
 
 #[derive(Clone)]
@@ -425,7 +519,15 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            // A ticket session activates exactly like a terminal, so it reuses
+            // the terminal variant rather than introducing a parallel one.
+            ListEntry::TicketSession(session) => Some(Self::Terminal {
+                metadata: session.metadata.clone(),
+                workspace: session.workspace.clone(),
+            }),
+            ListEntry::ProjectHeader { .. }
+            | ListEntry::TicketSectionHeader(_)
+            | ListEntry::Ticket(_) => None,
         }
     }
 }
@@ -435,7 +537,11 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_)
+            | ListEntry::ProjectHeader { .. }
+            | ListEntry::TicketSectionHeader(_)
+            | ListEntry::Ticket(_)
+            | ListEntry::TicketSession(_) => None,
         }
     }
 
@@ -453,6 +559,11 @@ impl ListEntry {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
+            ListEntry::TicketSession(session) => match &session.workspace {
+                ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
+                ThreadEntryWorkspace::Closed { .. } => Vec::new(),
+            },
+            ListEntry::Ticket(_) | ListEntry::TicketSectionHeader(_) => Vec::new(),
             ListEntry::ProjectHeader { key, .. } => {
                 multi_workspace.workspaces_for_project_group(key, cx)
             }
@@ -496,6 +607,23 @@ enum EntryShape {
     },
     Thread(ThreadId),
     Terminal(TerminalId),
+    TicketSectionHeader {
+        key: TicketSectionKey,
+        // Gates the "No tickets" empty-state row, mirroring `ProjectHeader.has_threads`.
+        is_empty: bool,
+    },
+    /// Deliberately carries no expansion flag: expanding a ticket does not
+    /// change the ticket row's own height (only the chevron glyph rotates), so
+    /// leaving it out lets `apply_list_state_diff` match the prefix straight
+    /// through the ticket row and splice in only the inserted child range.
+    Ticket {
+        ticket_id: TicketId,
+        has_metadata_row: bool,
+    },
+    /// Distinct from `Terminal` even though the payload matches, so a terminal
+    /// that changes classification between rebuilds does not compare equal at a
+    /// different height.
+    TicketSession(TerminalId),
 }
 
 impl SidebarContents {
@@ -789,6 +917,9 @@ pub struct Sidebar {
     /// Display names of other release channels that have threads available to
     /// import.
     cross_channel_import_channels: Vec<SharedString>,
+    /// Tickets whose Claude Code session rows are revealed beneath them.
+    expanded_tickets: HashSet<TicketId>,
+    collapsed_ticket_sections: HashSet<TicketSectionKey>,
 }
 
 impl Sidebar {
@@ -805,7 +936,7 @@ impl Sidebar {
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search threads…", window, cx);
+            editor.set_placeholder_text("Search tickets & threads…", window, cx);
             editor
         });
         let thread_rename_editor = cx.new(|cx| Editor::single_line(window, cx));
@@ -864,6 +995,16 @@ impl Sidebar {
         )
         .detach();
 
+        // `try_global` rather than `global`: tests (and any host that skips
+        // `agent_ui::init`) have no ticket store, and the sidebar must degrade
+        // to "no tickets" rather than panic.
+        if let Some(store) = TicketMetadataStore::try_global(cx) {
+            cx.observe(&store, |this, _store, cx| {
+                this.schedule_update_entries(false, cx);
+            })
+            .detach();
+        }
+
         let channels_with_threads = channels_with_threads(cx);
         cx.spawn(async move |this, cx| {
             let channels = channels_with_threads.await;
@@ -920,6 +1061,8 @@ impl Sidebar {
             update_task: None,
             import_banners_use_verbose_labels: None,
             cross_channel_import_channels: Vec::new(),
+            expanded_tickets: HashSet::new(),
+            collapsed_ticket_sections: HashSet::new(),
         }
     }
 
@@ -1388,18 +1531,24 @@ impl Sidebar {
         };
 
         let groups = mw.project_groups(cx);
-        let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        // Ticket rows need liveness, not only notifications, so the whole
+        // live-terminal map is retained rather than just the notified ids.
+        let mut live_terminals: HashMap<TerminalId, AgentPanelTerminalInfo> = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
-                    agent_panel
-                        .read(cx)
-                        .terminals(cx)
-                        .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
-                );
+                for terminal in agent_panel.read(cx).terminals(cx) {
+                    live_terminals.insert(terminal.id, terminal);
+                }
             }
         }
+        let live_notified_terminal_ids: HashSet<TerminalId> = live_terminals
+            .iter()
+            .filter_map(|(id, terminal)| terminal.has_notification.then_some(*id))
+            .collect();
+
+        let show_zed_agent_threads = AgentSettings::get_global(cx).show_zed_agent_threads;
+        let mut ticket_buckets =
+            self.collect_ticket_entries(&groups, &workspaces, &live_terminals, cx);
 
         let mut all_paths: Vec<PathBuf> = groups
             .iter()
@@ -1473,8 +1622,15 @@ impl Sidebar {
             let mut terminals = Vec::new();
             let terminal_store = TerminalThreadMetadataStore::global(cx);
             let group_host = group_key.host();
+            let ticket_session_terminal_ids = &ticket_buckets.session_terminal_ids;
             let mut push_terminal_metadata =
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
+                    // A `gtr` worktree is a linked worktree of the base repo, so the
+                    // linked-worktree lookups below would otherwise emit every ticket
+                    // session a second time as a plain terminal row.
+                    if ticket_session_terminal_ids.contains(&metadata.terminal_id) {
+                        return;
+                    }
                     if !seen_terminal_ids.insert(metadata.terminal_id) {
                         return;
                     }
@@ -1540,8 +1696,14 @@ impl Sidebar {
 
             let label = group_key.display_name(&path_detail_map);
 
+            let group_tickets = ticket_buckets
+                .by_group
+                .remove(group_key)
+                .unwrap_or_default();
+
             let is_collapsed = self.is_group_collapsed(group_key, cx);
-            let should_load_threads = !is_collapsed || !query.is_empty();
+            let should_load_threads =
+                show_zed_agent_threads && (!is_collapsed || !query.is_empty());
 
             let is_active = active_workspace
                 .as_ref()
@@ -1735,7 +1897,10 @@ impl Sidebar {
                                 .is_some_and(|active| active == entry.workspace())
                     });
 
-                    if thread.status == AgentThreadStatus::Completed
+                    // Only badge threads that have a row to click; with
+                    // `show_zed_agent_threads` off the badge would be unclearable.
+                    if show_zed_agent_threads
+                        && thread.status == AgentThreadStatus::Completed
                         && !is_active_thread
                         && session_id
                             .as_ref()
@@ -1779,7 +1944,8 @@ impl Sidebar {
                     if let Some(thread_id) = thread_id {
                         let old_status = old_statuses.get(&info.session_id).map(|(s, _)| *s);
                         new_live_statuses.insert(info.session_id.clone(), (info.status, thread_id));
-                        if info.status == AgentThreadStatus::Completed
+                        if show_zed_agent_threads
+                            && info.status == AgentThreadStatus::Completed
                             && old_status == Some(AgentThreadStatus::Running)
                         {
                             notified_threads.insert(thread_id);
@@ -1794,22 +1960,24 @@ impl Sidebar {
                 }
             }
 
-            let has_visible_rows = !threads.is_empty() || !terminals.is_empty();
-            let has_stored_thread_rows = !should_load_threads && !has_visible_rows && {
-                let store = ThreadMetadataStore::global(cx).read(cx);
-                store
-                    .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
-                    .any(|metadata| {
-                        let workspace = resolve_workspace(metadata.folder_paths());
-                        thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
-                    })
-                    || store
-                        .entries_for_path(group_key.path_list(), group_host.as_ref())
+            let has_visible_rows =
+                !threads.is_empty() || !terminals.is_empty() || !group_tickets.is_empty();
+            let has_stored_thread_rows =
+                show_zed_agent_threads && !should_load_threads && !has_visible_rows && {
+                    let store = ThreadMetadataStore::global(cx).read(cx);
+                    store
+                        .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
                         .any(|metadata| {
                             let workspace = resolve_workspace(metadata.folder_paths());
                             thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
                         })
-            };
+                        || store
+                            .entries_for_path(group_key.path_list(), group_host.as_ref())
+                            .any(|metadata| {
+                                let workspace = resolve_workspace(metadata.folder_paths());
+                                thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
+                            })
+                };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
             if !query.is_empty() {
@@ -1868,7 +2036,13 @@ impl Sidebar {
                     }
                 }
 
-                if matched_threads.is_empty() && matched_terminals.is_empty() && !workspace_matched
+                let matched_tickets =
+                    Self::filter_tickets_by_query(&query, workspace_matched, group_tickets);
+
+                if matched_threads.is_empty()
+                    && matched_terminals.is_empty()
+                    && matched_tickets.is_empty()
+                    && !workspace_matched
                 {
                     continue;
                 }
@@ -1880,6 +2054,8 @@ impl Sidebar {
                 let has_terminal_notifications = matched_terminals
                     .iter()
                     .any(|t| notified_terminals.contains(&t.metadata.terminal_id));
+                let has_ticket_notifications =
+                    matched_tickets.iter().any(|ticket| ticket.has_notification);
 
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
@@ -1888,10 +2064,19 @@ impl Sidebar {
                     highlight_positions: workspace_highlight_positions,
                     has_running_threads,
                     waiting_thread_count,
-                    has_notifications: has_thread_notifications || has_terminal_notifications,
+                    has_notifications: has_thread_notifications
+                        || has_terminal_notifications
+                        || has_ticket_notifications,
                     is_active,
                     has_threads,
                 });
+
+                Self::push_ticket_entries(
+                    &mut entries,
+                    matched_tickets,
+                    &self.expanded_tickets,
+                    true,
+                );
 
                 Self::push_entries_by_display_time(
                     &mut entries,
@@ -1927,6 +2112,9 @@ impl Sidebar {
                         .any(|t| notified_threads.contains(&t.metadata.thread_id))
                 };
 
+                let has_ticket_notifications =
+                    group_tickets.iter().any(|ticket| ticket.has_notification);
+
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
                     key: group_key.clone(),
@@ -1934,7 +2122,9 @@ impl Sidebar {
                     highlight_positions: Vec::new(),
                     has_running_threads,
                     waiting_thread_count,
-                    has_notifications: has_thread_notifications || has_terminal_notifications,
+                    has_notifications: has_thread_notifications
+                        || has_terminal_notifications
+                        || has_ticket_notifications,
                     is_active,
                     has_threads,
                 });
@@ -1942,6 +2132,13 @@ impl Sidebar {
                 if is_collapsed {
                     continue;
                 }
+
+                Self::push_ticket_entries(
+                    &mut entries,
+                    group_tickets,
+                    &self.expanded_tickets,
+                    false,
+                );
 
                 Self::push_entries_by_display_time(
                     &mut entries,
@@ -1952,6 +2149,70 @@ impl Sidebar {
                 );
             }
         }
+
+        // Tickets whose base repo is not an open project group, then the
+        // tickets with no worktree yet. Emitted after every project group so
+        // they read as trailing sections rather than interleaving with them.
+        let mut ticket_sections: Vec<(TicketSectionKey, SharedString, Vec<TicketEntry>)> =
+            mem::take(&mut ticket_buckets.unopened_repos)
+                .into_values()
+                .map(|(key, tickets)| {
+                    let label = match &key {
+                        TicketSectionKey::Repo { root, .. } => {
+                            SharedString::from(project::path_suffix(root, 0))
+                        }
+                        TicketSectionKey::ReadyForDev => READY_FOR_DEV_SECTION_LABEL.into(),
+                    };
+                    (key, label, tickets)
+                })
+                .collect();
+        ticket_sections.push((
+            TicketSectionKey::ReadyForDev,
+            READY_FOR_DEV_SECTION_LABEL.into(),
+            mem::take(&mut ticket_buckets.ready_for_dev),
+        ));
+
+        for (key, label, tickets) in ticket_sections {
+            let tickets = if query.is_empty() {
+                tickets
+            } else {
+                let label_matched = fuzzy_match_positions(&query, &label).is_some();
+                Self::filter_tickets_by_query(&query, label_matched, tickets)
+            };
+            if tickets.is_empty() {
+                continue;
+            }
+
+            let has_running_sessions = tickets
+                .iter()
+                .any(|ticket| matches!(ticket.session_state, TicketSessionState::Running { .. }));
+            let has_notifications = tickets.iter().any(|ticket| ticket.has_notification);
+            let is_collapsed = query.is_empty() && self.collapsed_ticket_sections.contains(&key);
+
+            entries.push(ListEntry::TicketSectionHeader(TicketSectionHeaderEntry {
+                key,
+                label,
+                ticket_count: tickets.len(),
+                has_running_sessions,
+                has_notifications,
+            }));
+
+            if is_collapsed {
+                continue;
+            }
+
+            Self::push_ticket_entries(
+                &mut entries,
+                tickets,
+                &self.expanded_tickets,
+                !query.is_empty(),
+            );
+        }
+
+        // Ticket sessions never become plain `Terminal` rows, so their ids have
+        // to be folded in here or the retains below would purge their state.
+        current_terminal_ids.extend(ticket_buckets.session_terminal_ids.iter().copied());
+        notified_terminals.extend(ticket_buckets.notified_session_terminal_ids.iter().copied());
 
         notified_threads.retain(|id| current_thread_ids.contains(id));
 
@@ -2067,6 +2328,17 @@ impl Sidebar {
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::TicketSectionHeader(header) => EntryShape::TicketSectionHeader {
+                key: header.key.clone(),
+                is_empty: header.ticket_count == 0,
+            },
+            ListEntry::Ticket(ticket) => EntryShape::Ticket {
+                ticket_id: ticket.record.ticket_id.clone(),
+                has_metadata_row: ticket_has_metadata_row(ticket),
+            },
+            ListEntry::TicketSession(session) => {
+                EntryShape::TicketSession(session.metadata.terminal_id)
+            }
         })
     }
 
@@ -2151,7 +2423,15 @@ impl Sidebar {
             .contents
             .entries
             .iter()
-            .position(|entry| matches!(entry, ListEntry::Thread(_) | ListEntry::Terminal(_)))
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::Thread(_)
+                        | ListEntry::Terminal(_)
+                        | ListEntry::Ticket(_)
+                        | ListEntry::TicketSession(_)
+                )
+            })
             .or_else(|| {
                 if self.contents.entries.is_empty() {
                     None
@@ -2174,8 +2454,11 @@ impl Sidebar {
         // is_selected means the keyboard selector is here.
         let is_selected = is_focused && self.selection == Some(ix);
 
-        let is_group_header_after_first =
-            ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
+        let is_group_header_after_first = ix > 0
+            && matches!(
+                entry,
+                ListEntry::ProjectHeader { .. } | ListEntry::TicketSectionHeader(_)
+            );
 
         let is_active = self
             .active_entry
@@ -2217,6 +2500,13 @@ impl Sidebar {
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
+            }
+            ListEntry::TicketSectionHeader(header) => {
+                self.render_ticket_section_header(ix, header, is_selected, cx)
+            }
+            ListEntry::Ticket(ticket) => self.render_ticket(ix, ticket, is_selected, cx),
+            ListEntry::TicketSession(session) => {
+                self.render_ticket_session(ix, session, is_active, is_selected, cx)
             }
         };
 
@@ -3558,6 +3848,19 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, false, window, cx);
             }
+            ListEntry::TicketSectionHeader(header) => {
+                let key = header.key.clone();
+                self.toggle_ticket_section_collapsed(key, cx);
+            }
+            ListEntry::Ticket(ticket) => {
+                let ticket_id = ticket.record.ticket_id.clone();
+                self.toggle_ticket_expanded(ticket_id, cx);
+            }
+            ListEntry::TicketSession(session) => {
+                let metadata = session.metadata.clone();
+                let workspace = session.workspace.clone();
+                self.activate_terminal_entry(metadata, workspace, false, window, cx);
+            }
         }
     }
 
@@ -4267,6 +4570,26 @@ impl Sidebar {
                     cx.notify();
                 }
             }
+            Some(ListEntry::TicketSectionHeader(header)) => {
+                let key = header.key.clone();
+                if self.collapsed_ticket_sections.contains(&key) {
+                    self.set_ticket_section_collapsed(key, false, cx);
+                } else if ix + 1 < self.contents.entries.len() {
+                    self.selection = Some(ix + 1);
+                    self.list_state.scroll_to_reveal_item(ix + 1);
+                    cx.notify();
+                }
+            }
+            Some(ListEntry::Ticket(ticket)) => {
+                let ticket_id = ticket.record.ticket_id.clone();
+                if !self.expanded_tickets.contains(&ticket_id) {
+                    self.set_ticket_expanded(ticket_id, true, cx);
+                } else if ix + 1 < self.contents.entries.len() {
+                    self.selection = Some(ix + 1);
+                    self.list_state.scroll_to_reveal_item(ix + 1);
+                    cx.notify();
+                }
+            }
             _ => {}
         }
     }
@@ -4287,19 +4610,57 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
-                for i in (0..ix).rev() {
-                    if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
-                    {
-                        let key = key.clone();
-                        self.selection = Some(i);
-                        self.set_group_expanded(&key, false, cx);
-                        self.update_entries(cx);
-                        break;
-                    }
+            Some(ListEntry::TicketSectionHeader(header)) => {
+                let key = header.key.clone();
+                if !self.collapsed_ticket_sections.contains(&key) {
+                    self.set_ticket_section_collapsed(key, true, cx);
                 }
             }
+            Some(ListEntry::Ticket(ticket)) => {
+                let ticket_id = ticket.record.ticket_id.clone();
+                if self.expanded_tickets.contains(&ticket_id) {
+                    self.set_ticket_expanded(ticket_id, false, cx);
+                } else {
+                    self.collapse_enclosing_section(ix, cx);
+                }
+            }
+            Some(ListEntry::TicketSession(session)) => {
+                let ticket_id = session.ticket_id.clone();
+                self.selection = (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::Ticket(ticket)) if ticket.record.ticket_id == ticket_id
+                    )
+                });
+                self.set_ticket_expanded(ticket_id, false, cx);
+            }
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+                self.collapse_enclosing_section(ix, cx);
+            }
             None => {}
+        }
+    }
+
+    /// Collapses whichever section header encloses the entry at `ix`, moving
+    /// the selection onto that header.
+    fn collapse_enclosing_section(&mut self, ix: usize, cx: &mut Context<Self>) {
+        for i in (0..ix).rev() {
+            match self.contents.entries.get(i) {
+                Some(ListEntry::ProjectHeader { key, .. }) => {
+                    let key = key.clone();
+                    self.selection = Some(i);
+                    self.set_group_expanded(&key, false, cx);
+                    self.update_entries(cx);
+                    return;
+                }
+                Some(ListEntry::TicketSectionHeader(header)) => {
+                    let key = header.key.clone();
+                    self.selection = Some(i);
+                    self.set_ticket_section_collapsed(key, true, cx);
+                    return;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -4311,6 +4672,25 @@ impl Sidebar {
     ) {
         let Some(ix) = self.selection else { return };
 
+        match self.contents.entries.get(ix) {
+            Some(ListEntry::TicketSectionHeader(header)) => {
+                let key = header.key.clone();
+                self.toggle_ticket_section_collapsed(key, cx);
+                return;
+            }
+            Some(ListEntry::Ticket(ticket)) => {
+                let ticket_id = ticket.record.ticket_id.clone();
+                self.toggle_ticket_expanded(ticket_id, cx);
+                return;
+            }
+            Some(ListEntry::TicketSession(session)) => {
+                let ticket_id = session.ticket_id.clone();
+                self.toggle_ticket_expanded(ticket_id, cx);
+                return;
+            }
+            _ => {}
+        }
+
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
@@ -4320,7 +4700,7 @@ impl Sidebar {
                     Some(ListEntry::ProjectHeader { .. })
                 )
             }),
-            None => None,
+            _ => None,
         };
 
         if let Some(header_ix) = header_ix {
@@ -4389,7 +4769,12 @@ impl Sidebar {
     /// activatable entry, the nearest one in the whole list.
     fn neighboring_activatable_entry(&self, current_position: usize) -> Option<ActivatableEntry> {
         let entries = &self.contents.entries;
-        let is_header = |entry: &ListEntry| matches!(entry, ListEntry::ProjectHeader { .. });
+        let is_header = |entry: &ListEntry| {
+            matches!(
+                entry,
+                ListEntry::ProjectHeader { .. } | ListEntry::TicketSectionHeader(_)
+            )
+        };
 
         let section_start = entries
             .get(..current_position)?
@@ -4994,12 +5379,10 @@ impl Sidebar {
             .contents
             .entries
             .iter()
-            .position(|entry| {
-                matches!(
-                    entry,
-                    ListEntry::Terminal(terminal)
-                        if terminal.metadata.terminal_id == terminal_id
-                )
+            .position(|entry| match entry {
+                ListEntry::Terminal(terminal) => terminal.metadata.terminal_id == terminal_id,
+                ListEntry::TicketSession(session) => session.metadata.terminal_id == terminal_id,
+                _ => false,
             })
             .and_then(|position| self.neighboring_activatable_entry(position));
 
@@ -5098,6 +5481,11 @@ impl Sidebar {
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.delete(terminal_id, cx);
+            });
+        }
+        if let Some(store) = TicketMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.mark_session_ended(terminal_id, Utc::now(), cx);
             });
         }
 
@@ -5664,6 +6052,11 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.close_terminal(&metadata, &workspace, window, cx);
             }
+            Some(ListEntry::TicketSession(session)) => {
+                let metadata = session.metadata.clone();
+                let workspace = session.workspace.clone();
+                self.close_terminal(&metadata, &workspace, window, cx);
+            }
             _ => {}
         }
     }
@@ -5718,7 +6111,10 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::TicketSectionHeader(_)
+                | ListEntry::Ticket(_)
+                | ListEntry::TicketSession(_) => unreachable!(),
             }
         }
 
@@ -5775,6 +6171,26 @@ impl Sidebar {
                     current_header_label = Some(label.clone());
                     current_header_key = Some(key.clone());
                     None
+                }
+                ListEntry::TicketSectionHeader(header) => {
+                    current_header_label = Some(header.label.clone());
+                    // A ticket section is not a project group, so entries below
+                    // it must not inherit the previous group's key.
+                    current_header_key = None;
+                    None
+                }
+                ListEntry::Ticket(_) => None,
+                ListEntry::TicketSession(session) => {
+                    let timestamp: SharedString =
+                        format_history_entry_timestamp(session.last_active_at).into();
+                    Some(ThreadSwitcherEntry::Terminal(ThreadSwitcherTerminalEntry {
+                        metadata: session.metadata.clone(),
+                        workspace: session.workspace.clone(),
+                        project_name: current_header_label.clone(),
+                        worktrees: Vec::new(),
+                        notified: session.has_notification,
+                        timestamp,
+                    }))
                 }
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
@@ -6942,13 +7358,23 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
-                (0..ix)
-                    .rev()
-                    .find_map(|i| match self.contents.entries.get(i) {
-                        Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-                        _ => None,
-                    })
+            Some(
+                ListEntry::Thread(_)
+                | ListEntry::Terminal(_)
+                | ListEntry::Ticket(_)
+                | ListEntry::TicketSession(_),
+            ) => {
+                for i in (0..ix).rev() {
+                    match self.contents.entries.get(i) {
+                        Some(ListEntry::ProjectHeader { key, .. }) => return Some(key.clone()),
+                        // A ticket section has no project group behind it, so
+                        // the walk must stop rather than crossing into the
+                        // group above it.
+                        Some(ListEntry::TicketSectionHeader(_)) => return None,
+                        _ => {}
+                    }
+                }
+                None
             }
             _ => None,
         }
@@ -7074,7 +7500,9 @@ impl Sidebar {
             .iter()
             .enumerate()
             .filter_map(|(ix, entry)| match entry {
-                ListEntry::Thread(_) | ListEntry::Terminal(_) => Some(ix),
+                ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::TicketSession(_) => {
+                    Some(ix)
+                }
                 _ => None,
             })
             .collect();
@@ -7131,7 +7559,14 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::TicketSession(session) => {
+                let metadata = session.metadata.clone();
+                let workspace = session.workspace.clone();
+                self.activate_terminal_entry(metadata, workspace, true, window, cx);
+            }
+            ListEntry::ProjectHeader { .. }
+            | ListEntry::TicketSectionHeader(_)
+            | ListEntry::Ticket(_) => {}
         }
     }
 
@@ -7151,9 +7586,9 @@ impl Sidebar {
     fn render_no_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = self.has_filter_query(cx);
         let message = if has_query {
-            "No threads match your search."
+            "No tickets or threads match your search."
         } else {
-            "No threads yet"
+            "No tickets or threads yet"
         };
 
         v_flex()
@@ -7607,6 +8042,662 @@ impl Sidebar {
         self.serialize(cx);
         cx.notify();
     }
+
+    // -----------------------------------------------------------------------
+    // Notion tickets. Every ticket-specific helper and renderer lives in this
+    // one block so the match arms above stay one-line delegations and an
+    // upstream rebase of this file only has to reconcile a single region.
+    // -----------------------------------------------------------------------
+
+    /// Buckets every ticket in the store into the project group whose repo it
+    /// was branched from, a section for repos that are not open in this window,
+    /// or the "Ready for Dev" section for tickets with no worktree yet.
+    fn collect_ticket_entries(
+        &self,
+        groups: &[workspace::ProjectGroup],
+        workspaces: &[Entity<Workspace>],
+        live_terminals: &HashMap<TerminalId, AgentPanelTerminalInfo>,
+        cx: &App,
+    ) -> TicketBuckets {
+        let mut buckets = TicketBuckets::default();
+        let (Some(ticket_store), Some(terminal_store)) = (
+            TicketMetadataStore::try_global(cx),
+            TerminalThreadMetadataStore::try_global(cx),
+        ) else {
+            return buckets;
+        };
+        let ticket_store = ticket_store.read(cx);
+        let terminal_store = terminal_store.read(cx);
+
+        let workspace_by_path_list: HashMap<PathList, Entity<Workspace>> = workspaces
+            .iter()
+            .map(|workspace| (workspace_path_list(workspace, cx), workspace.clone()))
+            .collect();
+
+        // Precomputed per group so the legacy lookup below does not redo the
+        // linked-worktree walk once per ticket record.
+        let group_paths: Vec<(&ProjectGroupKey, Vec<PathList>)> = groups
+            .iter()
+            .map(|group| {
+                let mut paths = linked_worktree_path_lists_for_workspaces(&group.workspaces, cx);
+                paths.extend(
+                    group
+                        .workspaces
+                        .iter()
+                        .map(|workspace| workspace_path_list(workspace, cx)),
+                );
+                (&group.key, paths)
+            })
+            .collect();
+
+        for record in ticket_store.entries_sorted() {
+            let host = record.remote_connection.as_ref();
+
+            // Primary rule: `save_worktree` persists `base_repo_root` as the
+            // `repo_path` handed to `git gtr new`, i.e. the repo's main worktree
+            // path, which is exactly what `ProjectGroupKey::from_project` keys a
+            // group on via `main_worktree_path_list`.
+            let group_key = record
+                .base_repo_root
+                .as_ref()
+                .and_then(|root| {
+                    groups
+                        .iter()
+                        .find(|group| {
+                            same_remote_connection_identity(group.key.host().as_ref(), host)
+                                && group
+                                    .key
+                                    .path_list()
+                                    .paths()
+                                    .iter()
+                                    .any(|path| path == root)
+                        })
+                        .map(|group| group.key.clone())
+                })
+                .or_else(|| {
+                    // Legacy rows never wrote `base_repo_root`, so fall back to
+                    // matching the worktree itself against each group's linked
+                    // worktrees and open workspaces.
+                    if record.base_repo_root.is_some() {
+                        return None;
+                    }
+                    let worktree_path = record.worktree_path.as_ref()?;
+                    group_paths
+                        .iter()
+                        .find(|(key, paths)| {
+                            same_remote_connection_identity(key.host().as_ref(), host)
+                                && paths.iter().any(|path_list| {
+                                    path_list.paths().iter().any(|path| path == worktree_path)
+                                })
+                        })
+                        .map(|(key, _)| (*key).clone())
+                });
+
+            let section_key = if group_key.is_some() {
+                None
+            } else if let Some(root) = record
+                .base_repo_root
+                .clone()
+                .or_else(|| record.worktree_path.clone())
+            {
+                Some(TicketSectionKey::Repo {
+                    root,
+                    host: record.remote_connection.clone(),
+                })
+            } else {
+                Some(TicketSectionKey::ReadyForDev)
+            };
+
+            // Sessions of a ticket in an unopened repo still need a group key to
+            // reopen the workspace with, so synthesize one from the repo root.
+            let session_group_key = group_key.clone().unwrap_or_else(|| {
+                let root: Vec<PathBuf> = record
+                    .base_repo_root
+                    .clone()
+                    .or_else(|| record.worktree_path.clone())
+                    .into_iter()
+                    .collect();
+                ProjectGroupKey::new(record.remote_connection.clone(), PathList::new(&root))
+            });
+
+            let mut sessions = Vec::new();
+            for session in &record.sessions {
+                // No terminal metadata means the terminal was closed or purged;
+                // there is nothing left to resume, so the row is dropped.
+                let Some(metadata) = terminal_store.entry(session.terminal_id).cloned() else {
+                    continue;
+                };
+                let workspace = workspace_by_path_list
+                    .get(metadata.folder_paths())
+                    .map(|workspace| ThreadEntryWorkspace::Open(workspace.clone()))
+                    .unwrap_or_else(|| ThreadEntryWorkspace::Closed {
+                        folder_paths: metadata.folder_paths().clone(),
+                        project_group_key: session_group_key.clone(),
+                    });
+                let live = live_terminals.get(&session.terminal_id);
+                let has_notification = live.is_some_and(|terminal| terminal.has_notification);
+
+                buckets.session_terminal_ids.insert(session.terminal_id);
+                if has_notification {
+                    buckets
+                        .notified_session_terminal_ids
+                        .insert(session.terminal_id);
+                }
+
+                sessions.push(TicketSessionEntry {
+                    ticket_id: record.ticket_id.clone(),
+                    metadata,
+                    workspace,
+                    is_live: live.is_some(),
+                    last_active_at: session.last_resumed_at.unwrap_or(session.created_at),
+                    has_notification,
+                    highlight_positions: Vec::new(),
+                });
+            }
+            sessions.sort_by(|left, right| {
+                right
+                    .last_active_at
+                    .cmp(&left.last_active_at)
+                    .then_with(|| left.metadata.terminal_id.cmp(&right.metadata.terminal_id))
+            });
+
+            let live_count = sessions.iter().filter(|session| session.is_live).count();
+            let session_state = if live_count > 0 {
+                TicketSessionState::Running {
+                    live: live_count,
+                    total: sessions.len(),
+                }
+            } else if sessions.is_empty() {
+                TicketSessionState::NeverLaunched
+            } else {
+                TicketSessionState::Idle {
+                    total: sessions.len(),
+                }
+            };
+
+            let worktree_label = record
+                .branch_name
+                .clone()
+                .map(SharedString::from)
+                .or_else(|| {
+                    let worktree_path = record.worktree_path.as_ref()?;
+                    worktree_path
+                        .file_name()
+                        .map(|name| SharedString::from(name.to_string_lossy().to_string()))
+                });
+
+            let entry = TicketEntry {
+                has_notification: sessions.iter().any(|session| session.has_notification),
+                record: Arc::new(record.clone()),
+                worktree_label,
+                session_state,
+                sessions,
+                highlight_positions: Vec::new(),
+            };
+
+            match (group_key, section_key) {
+                (Some(group_key), _) => {
+                    buckets.by_group.entry(group_key).or_default().push(entry);
+                }
+                (None, Some(TicketSectionKey::ReadyForDev)) => {
+                    buckets.ready_for_dev.push(entry);
+                }
+                (None, Some(section_key)) => {
+                    buckets
+                        .unopened_repos
+                        .entry(section_key.sort_key())
+                        .or_insert_with(|| (section_key, Vec::new()))
+                        .1
+                        .push(entry);
+                }
+                (None, None) => {}
+            }
+        }
+
+        buckets
+    }
+
+    /// Keeps the tickets that match `query`, either directly, because their
+    /// container (project group or section) matched, or because one of their
+    /// sessions matched. A ticket kept only for a session match is narrowed to
+    /// the sessions that actually matched.
+    fn filter_tickets_by_query(
+        query: &str,
+        container_matched: bool,
+        tickets: Vec<TicketEntry>,
+    ) -> Vec<TicketEntry> {
+        let mut matched = Vec::new();
+        for mut ticket in tickets {
+            let title_positions = fuzzy_match_positions(query, &ticket.record.title);
+            let field_matched = [
+                ticket.record.issue_id.as_deref(),
+                ticket.record.status.as_deref(),
+                ticket.record.branch_name.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|field| fuzzy_match_positions(query, field).is_some());
+            let ticket_matched = title_positions.is_some() || field_matched;
+            if let Some(positions) = title_positions {
+                ticket.highlight_positions = positions;
+            }
+
+            let mut session_matched = false;
+            for session in &mut ticket.sessions {
+                let title = session.metadata.display_title();
+                match fuzzy_match_positions(query, title.as_ref()) {
+                    Some(positions) => {
+                        session.highlight_positions = positions;
+                        session_matched = true;
+                    }
+                    None => session.highlight_positions.clear(),
+                }
+            }
+
+            if !ticket_matched && !container_matched && !session_matched {
+                continue;
+            }
+            if !ticket_matched && !container_matched {
+                ticket
+                    .sessions
+                    .retain(|session| !session.highlight_positions.is_empty());
+            }
+            matched.push(ticket);
+        }
+        matched
+    }
+
+    fn push_ticket_entries(
+        entries: &mut Vec<ListEntry>,
+        tickets: Vec<TicketEntry>,
+        expanded: &HashSet<TicketId>,
+        force_expand: bool,
+    ) {
+        for ticket in tickets {
+            let is_expanded = force_expand || expanded.contains(&ticket.record.ticket_id);
+            let sessions = if is_expanded {
+                ticket.sessions.clone()
+            } else {
+                Vec::new()
+            };
+            entries.push(ListEntry::Ticket(Arc::new(ticket)));
+            for session in sessions {
+                entries.push(ListEntry::TicketSession(session));
+            }
+        }
+    }
+
+    fn set_ticket_expanded(&mut self, ticket_id: TicketId, expanded: bool, cx: &mut Context<Self>) {
+        let changed = if expanded {
+            self.expanded_tickets.insert(ticket_id)
+        } else {
+            self.expanded_tickets.remove(&ticket_id)
+        };
+        if !changed {
+            return;
+        }
+        self.serialize(cx);
+        // `update_entries` (not just `notify`) is what snapshots
+        // `previous_shapes` and splices the inserted/removed child range.
+        self.update_entries(cx);
+    }
+
+    fn toggle_ticket_expanded(&mut self, ticket_id: TicketId, cx: &mut Context<Self>) {
+        let expanded = !self.expanded_tickets.contains(&ticket_id);
+        self.set_ticket_expanded(ticket_id, expanded, cx);
+    }
+
+    fn set_ticket_section_collapsed(
+        &mut self,
+        key: TicketSectionKey,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if collapsed {
+            self.collapsed_ticket_sections.insert(key)
+        } else {
+            self.collapsed_ticket_sections.remove(&key)
+        };
+        if !changed {
+            return;
+        }
+        self.serialize(cx);
+        self.update_entries(cx);
+    }
+
+    fn toggle_ticket_section_collapsed(&mut self, key: TicketSectionKey, cx: &mut Context<Self>) {
+        let collapsed = !self.collapsed_ticket_sections.contains(&key);
+        self.set_ticket_section_collapsed(key, collapsed, cx);
+    }
+
+    /// Entry point for starting work on a ticket. Wired to the launch modal
+    /// once that lands; deliberately inert for now so this task does not race
+    /// the signature change happening in the launch path.
+    /// Opens the ticket launch modal. Goes through an action rather than a
+    /// direct call so this crate stays free of any dependency on the Notion
+    /// crate that owns the modal; `ticket_sync` registers the handler.
+    fn start_ticket_work(
+        &mut self,
+        ticket_id: TicketId,
+        launch_kind_is_additional: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.dispatch_action(
+            Box::new(agent_ui::StartTicketWork {
+                ticket_id: ticket_id.0.to_string(),
+                additional_session: launch_kind_is_additional,
+            }),
+            cx,
+        );
+    }
+
+    fn render_ticket(
+        &self,
+        ix: usize,
+        ticket: &Arc<TicketEntry>,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let record = ticket.record.clone();
+        let ticket_id = record.ticket_id.clone();
+        let is_hovered = self.hovered_thread_index == Some(ix);
+        let is_expanded = self.has_filter_query(cx) || self.expanded_tickets.contains(&ticket_id);
+
+        let color = cx.theme().colors();
+        let sidebar_bg = color
+            .title_bar_background
+            .blend(color.panel_background.opacity(0.25));
+
+        let timestamp: SharedString = ticket
+            .sessions
+            .iter()
+            .map(|session| session.last_active_at)
+            .max()
+            .map(|at| SharedString::from(format_history_entry_timestamp(at)))
+            .unwrap_or_default();
+
+        let url = record.url.clone();
+        let has_worktree = record.worktree_path.is_some();
+        let (work_button_id, work_button_icon, work_button_label) = if has_worktree {
+            (
+                "launch-additional-ticket-session",
+                IconName::Plus,
+                "Launch an Additional Session",
+            )
+        } else {
+            (
+                "create-ticket-worktree",
+                IconName::GitBranch,
+                "Create Worktree",
+            )
+        };
+
+        let action_slot = h_flex()
+            .gap_px()
+            .child(
+                IconButton::new("open-ticket-in-notion", IconName::ArrowUpRight)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Open in Notion"))
+                    .on_click(move |_, _window, cx| cx.open_url(&url)),
+            )
+            .child(
+                IconButton::new(work_button_id, work_button_icon)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text(work_button_label))
+                    .on_click(cx.listener({
+                        let ticket_id = ticket_id.clone();
+                        move |this, _, window, cx| {
+                            this.start_ticket_work(ticket_id.clone(), has_worktree, window, cx);
+                        }
+                    })),
+            );
+
+        TicketItem::new(
+            SharedString::from(format!("ticket-entry-{ix}")),
+            record.title.clone(),
+        )
+        .base_bg(sidebar_bg)
+        .when_some(record.issue_id.clone(), |this, issue_id| {
+            this.issue_id(issue_id)
+        })
+        .when_some(record.status.clone(), |this, status| this.status(status))
+        .when_some(record.ticket_type.clone(), |this, ticket_type| {
+            this.ticket_type(ticket_type)
+        })
+        .when_some(ticket.worktree_label.clone(), |this, label| {
+            this.worktree_label(label)
+        })
+        .session_state(ticket.session_state)
+        .timestamp(timestamp)
+        .highlight_positions(ticket.highlight_positions.clone())
+        .expandable(!ticket.sessions.is_empty())
+        .expanded(is_expanded)
+        .focused(is_focused)
+        .hovered(is_hovered)
+        .notified(ticket.has_notification)
+        .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
+            if *is_hovered {
+                this.hovered_thread_index = Some(ix);
+            } else if this.hovered_thread_index == Some(ix) {
+                this.hovered_thread_index = None;
+            }
+            cx.notify();
+        }))
+        .when(is_hovered, |this| this.action_slot(action_slot))
+        .on_toggle(cx.listener({
+            let ticket_id = ticket_id.clone();
+            move |this, _, _window, cx| {
+                this.toggle_ticket_expanded(ticket_id.clone(), cx);
+            }
+        }))
+        .on_click(cx.listener(move |this, _, _window, cx| {
+            this.toggle_ticket_expanded(ticket_id.clone(), cx);
+        }))
+        .into_any_element()
+    }
+
+    fn render_ticket_session(
+        &self,
+        ix: usize,
+        session: &TicketSessionEntry,
+        is_active: bool,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = ElementId::from(format!("ticket-session-{}", session.metadata.terminal_id));
+        let is_hovered = self.hovered_thread_index == Some(ix);
+        let color = cx.theme().colors();
+        let sidebar_bg = color
+            .title_bar_background
+            .blend(color.panel_background.opacity(0.25));
+        let timestamp = format_history_entry_timestamp(session.last_active_at);
+        let focus_handle = self.focus_handle.clone();
+        let is_remote = session.workspace.is_remote(cx);
+
+        let display_title = session.metadata.display_title();
+        let (icon_char, title, highlight_positions) =
+            match split_leading_icon_char(&display_title, &session.highlight_positions) {
+                Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
+                None => (None, display_title, session.highlight_positions.clone()),
+            };
+
+        let status = if session.is_live {
+            AgentThreadStatus::Running
+        } else {
+            AgentThreadStatus::Completed
+        };
+
+        h_flex()
+            .w_full()
+            .pl_3()
+            .child(
+                ThreadItem::new(id, title)
+                    .base_bg(sidebar_bg)
+                    .icon(IconName::Terminal)
+                    .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+                    .is_remote(is_remote)
+                    .status(status)
+                    .timestamp(timestamp)
+                    .notified(session.has_notification)
+                    .highlight_positions(highlight_positions)
+                    .selected(is_active)
+                    .focused(is_focused)
+                    .hovered(is_hovered)
+                    .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
+                        if *is_hovered {
+                            this.hovered_thread_index = Some(ix);
+                        } else if this.hovered_thread_index == Some(ix) {
+                            this.hovered_thread_index = None;
+                        }
+                        cx.notify();
+                    }))
+                    .when(is_hovered, |this| {
+                        let metadata = session.metadata.clone();
+                        let workspace = session.workspace.clone();
+                        this.action_slot(
+                            IconButton::new("close-ticket-session", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::for_action_in(
+                                        "Close Session",
+                                        &ArchiveSelectedThread,
+                                        &focus_handle,
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_terminal(&metadata, &workspace, window, cx);
+                                })),
+                        )
+                    })
+                    .on_click(cx.listener({
+                        let metadata = session.metadata.clone();
+                        let workspace = session.workspace.clone();
+                        // Routing through `activate_terminal_entry` (rather than
+                        // `AgentPanel::restore_terminal`) is what makes resuming a
+                        // session whose workspace is closed work without new plumbing.
+                        move |this, _, window, cx| {
+                            this.activate_terminal_entry(
+                                metadata.clone(),
+                                workspace.clone(),
+                                false,
+                                window,
+                                cx,
+                            );
+                        }
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_ticket_section_header(
+        &self,
+        ix: usize,
+        header: &TicketSectionHeaderEntry,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = header.key.clone();
+        let is_collapsed = self.collapsed_ticket_sections.contains(&key);
+        let disclosure_icon = if is_collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+
+        let color = cx.theme().colors();
+        let sidebar_base_bg = color
+            .title_bar_background
+            .blend(color.panel_background.opacity(0.25));
+        let base_bg = color.background.blend(sidebar_base_bg);
+        let hover_solid = base_bg.blend(
+            color
+                .element_active
+                .blend(color.element_background.opacity(0.2)),
+        );
+
+        let hint = match &header.key {
+            TicketSectionKey::Repo { .. } => Some("not open"),
+            TicketSectionKey::ReadyForDev => None,
+        };
+
+        h_flex()
+            .id(SharedString::from(format!("ticket-section-header-{ix}")))
+            .cursor_pointer()
+            .h(Tab::content_height(cx))
+            .w_full()
+            .pl_2()
+            .pr_1p5()
+            .gap_1()
+            .border_1()
+            .map(|this| {
+                if is_focused {
+                    this.border_color(color.border_focused)
+                } else {
+                    this.border_color(gpui::transparent_black())
+                }
+            })
+            .hover(|style| style.bg(hover_solid))
+            .child(
+                Label::new(header.label.clone())
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .when_some(hint, |this, hint| {
+                this.child(
+                    Label::new(hint)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .alpha(0.7),
+                )
+            })
+            .child(
+                Label::new(header.ticket_count.to_string())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .when(is_collapsed && header.has_running_sessions, |this| {
+                this.child(
+                    Icon::new(IconName::LoadCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Success)
+                        .with_keyed_rotate_animation(format!("ticket-section-spinner-{ix}"), 2),
+                )
+            })
+            .when(
+                is_collapsed && header.has_notifications && !header.has_running_sessions,
+                |this| {
+                    this.child(
+                        Icon::new(IconName::Circle)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
+                },
+            )
+            .child(
+                Icon::new(disclosure_icon)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.toggle_ticket_section_collapsed(key.clone(), cx);
+            }))
+            .into_any_element()
+    }
+}
+
+/// Whether a ticket row renders its second (metadata) line, which changes the
+/// row's height and therefore has to be part of its [`EntryShape`].
+fn ticket_has_metadata_row(ticket: &TicketEntry) -> bool {
+    ticket.record.issue_id.is_some()
+        || ticket.record.status.is_some()
+        || ticket.record.ticket_type.is_some()
+        || ticket.worktree_label.is_some()
+        || !ticket.sessions.is_empty()
 }
 
 fn render_import_onboarding_banner(
@@ -7725,6 +8816,18 @@ impl WorkspaceSidebar for Sidebar {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
                 SidebarView::Archive(_) => SerializedSidebarView::History,
             },
+            expanded_tickets: self
+                .expanded_tickets
+                .iter()
+                .map(|ticket_id| ticket_id.0.to_string())
+                .sorted()
+                .collect(),
+            collapsed_ticket_sections: self
+                .collapsed_ticket_sections
+                .iter()
+                .cloned()
+                .sorted_by_key(TicketSectionKey::sort_key)
+                .collect(),
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -7739,6 +8842,13 @@ impl WorkspaceSidebar for Sidebar {
             if let Some(width) = serialized.width {
                 self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
             }
+            self.expanded_tickets = serialized
+                .expanded_tickets
+                .into_iter()
+                .map(TicketId::new)
+                .collect();
+            self.collapsed_ticket_sections =
+                serialized.collapsed_ticket_sections.into_iter().collect();
             if serialized.active_view == SerializedSidebarView::History {
                 cx.defer_in(window, |this, window, cx| {
                     this.show_archive(window, cx);

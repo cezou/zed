@@ -342,6 +342,23 @@ actions!(
     ]
 );
 
+/// Opens the launch modal for a Notion ticket: pick a repository, name the
+/// worktree, edit the brief, then start a Claude Code session.
+///
+/// Dispatched as an action rather than called directly so the sidebar, which
+/// renders the ticket rows, does not have to depend on the Notion crate that
+/// owns the modal.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = tickets)]
+#[serde(deny_unknown_fields)]
+pub struct StartTicketWork {
+    /// The ticket's Notion page id, as stored in the ticket metadata store.
+    pub ticket_id: String,
+    /// Whether the ticket already has a worktree, in which case this launches
+    /// one more session in it rather than cutting a new one.
+    pub additional_session: bool,
+}
+
 /// Action to authorize a tool call with a specific permission option.
 /// This is used by the permission granularity dropdown to authorize tool calls.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
@@ -1017,6 +1034,7 @@ mod tests {
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
+            show_zed_agent_threads: false,
             thinking_display: Default::default(),
         };
 

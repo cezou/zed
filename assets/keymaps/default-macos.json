@@ -1158,6 +1158,23 @@
     },
   },
   {
+    "context": "TicketLaunch",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "menu::Cancel",
+      "cmd-enter": "tickets::LaunchTicket",
+    },
+  },
+  {
+    "context": "TicketLaunch > Editor && mode == auto_height",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "editor::Newline",
+      "escape": "menu::Cancel",
+      "cmd-enter": "tickets::LaunchTicket",
+    },
+  },
+  {
     "context": "GitCommit > Editor && mode == auto_height",
     "use_key_equivalents": true,
     "bindings": {

@@ -11,6 +11,7 @@ use db::{
     },
     sqlez_macros::sql,
 };
+use fs::Fs;
 use gpui::{AppContext as _, AsyncApp, Entity, Global, Task, WindowHandle};
 use remote::RemoteConnectionOptions;
 use ui::{App, Context, SharedString};
@@ -65,11 +66,32 @@ pub struct TicketSessionRecord {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+/// The Notion-sourced half of a ticket record, refreshed on every board sync.
+///
+/// `body_markdown` is deliberately part of this struct but is *not* something
+/// a board query can supply — it costs one extra `notion-fetch` per page, so
+/// it is filled in lazily and preserved across syncs by [`TicketMetadataStore::upsert_ticket_ref`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TicketDisplayFields {
+    pub title: SharedString,
+    pub url: SharedString,
+    pub status: Option<SharedString>,
+    pub ticket_type: Option<SharedString>,
+    pub issue_id: Option<SharedString>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TicketWorktreeRecord {
     pub ticket_id: TicketId,
     pub title: SharedString,
     pub url: SharedString,
+    pub status: Option<SharedString>,
+    pub ticket_type: Option<SharedString>,
+    pub issue_id: Option<SharedString>,
+    /// The Notion page body, cleaned to markdown. Fetched on demand rather
+    /// than on every sync.
+    pub body_markdown: Option<String>,
+    pub body_fetched_at: Option<DateTime<Utc>>,
     pub worktree_path: Option<PathBuf>,
     pub branch_name: Option<String>,
     pub base_repo_root: Option<PathBuf>,
@@ -83,10 +105,16 @@ impl TicketWorktreeRecord {
     /// used to decide what to resume when a ticket with an existing worktree
     /// is reopened.
     pub fn most_recent_session(&self) -> Option<&TicketSessionRecord> {
-        self.sessions.iter().max_by_key(|session| session.created_at)
+        self.sessions
+            .iter()
+            .max_by_key(|session| session.created_at)
     }
 
-    pub fn active_session_count(&self) -> usize {
+    /// Sessions that were never explicitly closed. Note this is *not* a
+    /// liveness signal — a crash or a reboot never writes `ended_at`, so a
+    /// caller that needs "is it running right now" must cross-check the
+    /// agent panel's live terminals.
+    pub fn unclosed_session_count(&self) -> usize {
         self.sessions
             .iter()
             .filter(|session| session.ended_at.is_none())
@@ -118,6 +146,10 @@ impl TestTicketMetadataDbName {
 pub struct TicketMetadataStore {
     db: TicketMetadataDb,
     tickets: HashMap<TicketId, TicketWorktreeRecord>,
+    /// Reverse index so a caller holding only a `TerminalId` (the sidebar
+    /// deciding whether a terminal row belongs to a ticket) doesn't have to
+    /// scan every ticket's sessions on every rebuild.
+    sessions_by_terminal: HashMap<TerminalId, TicketId>,
     pending_ops_tx: async_channel::Sender<DbOperation>,
     _db_operations_task: Task<()>,
 }
@@ -158,6 +190,28 @@ struct TicketWorktreeRow {
     base_repo_root: Option<PathBuf>,
     remote_connection: Option<RemoteConnectionOptions>,
     created_at: DateTime<Utc>,
+    status: Option<SharedString>,
+    ticket_type: Option<SharedString>,
+    issue_id: Option<SharedString>,
+    body_markdown: Option<String>,
+    body_fetched_at: Option<DateTime<Utc>>,
+}
+
+/// Orders tickets by the leading integer of their raw Notion status string
+/// (`"3 - In progress"` → `3`). Statuses without one sort last so a board that
+/// stops numbering its options degrades to title order rather than to an
+/// arbitrary one.
+fn status_rank(status: Option<&SharedString>) -> u32 {
+    status
+        .and_then(|status| {
+            let digits: String = status
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .unwrap_or(u32::MAX)
 }
 
 impl TicketMetadataStore {
@@ -197,27 +251,66 @@ impl TicketMetadataStore {
         self.tickets.values()
     }
 
+    /// Tickets in a deterministic order: by status, then title, then id.
+    /// `entries` iterates a `HashMap`, so consecutive calls can yield
+    /// different orders; UIs that memoize per-row heights across rebuilds
+    /// would reshuffle their rows on every rebuild if fed that.
+    pub fn entries_sorted(&self) -> Vec<&TicketWorktreeRecord> {
+        let mut entries: Vec<&TicketWorktreeRecord> = self.tickets.values().collect();
+        entries.sort_by(|left, right| {
+            status_rank(left.status.as_ref())
+                .cmp(&status_rank(right.status.as_ref()))
+                .then_with(|| left.title.cmp(&right.title))
+                .then_with(|| left.ticket_id.0.cmp(&right.ticket_id.0))
+        });
+        entries
+    }
+
+    pub fn ticket_id_for_terminal(&self, terminal_id: TerminalId) -> Option<&TicketId> {
+        self.sessions_by_terminal.get(&terminal_id)
+    }
+
+    pub fn session_for_terminal(&self, terminal_id: TerminalId) -> Option<&TicketSessionRecord> {
+        let ticket_id = self.sessions_by_terminal.get(&terminal_id)?;
+        self.tickets
+            .get(ticket_id)?
+            .sessions
+            .iter()
+            .find(|session| session.terminal_id == terminal_id)
+    }
+
     /// Records or refreshes a ticket's display metadata as synced from
     /// Notion. Never touches worktree/session state — safe to call on every
     /// refresh regardless of whether a worktree exists yet.
+    ///
+    /// A board sync cannot supply the page body, so `body_markdown` and
+    /// `body_fetched_at` are carried over from the existing record instead of
+    /// being cleared on every sync.
     pub fn upsert_ticket_ref(
         &mut self,
         ticket_id: TicketId,
-        title: SharedString,
-        url: SharedString,
+        fields: TicketDisplayFields,
         cx: &mut Context<Self>,
     ) {
         let record = if let Some(existing) = self.tickets.get(&ticket_id) {
             TicketWorktreeRecord {
-                title,
-                url,
+                title: fields.title,
+                url: fields.url,
+                status: fields.status,
+                ticket_type: fields.ticket_type,
+                issue_id: fields.issue_id,
                 ..existing.clone()
             }
         } else {
             TicketWorktreeRecord {
-                ticket_id: ticket_id.clone(),
-                title,
-                url,
+                ticket_id,
+                title: fields.title,
+                url: fields.url,
+                status: fields.status,
+                ticket_type: fields.ticket_type,
+                issue_id: fields.issue_id,
+                body_markdown: None,
+                body_fetched_at: None,
                 worktree_path: None,
                 branch_name: None,
                 base_repo_root: None,
@@ -227,6 +320,26 @@ impl TicketMetadataStore {
             }
         };
         self.save_worktree_record(record, cx);
+    }
+
+    /// Caches the ticket's Notion page body, which is fetched lazily rather
+    /// than during a board sync.
+    pub fn save_body(
+        &mut self,
+        ticket_id: &TicketId,
+        markdown: String,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let Some(existing) = self.tickets.get(ticket_id) else {
+            anyhow::bail!("cannot save a body for an unknown ticket {ticket_id:?}");
+        };
+        let record = TicketWorktreeRecord {
+            body_markdown: Some(markdown),
+            body_fetched_at: Some(Utc::now()),
+            ..existing.clone()
+        };
+        self.save_worktree_record(record, cx);
+        Ok(())
     }
 
     /// Persists a newly created worktree's location for a ticket. The ticket
@@ -264,6 +377,11 @@ impl TicketMetadataStore {
             base_repo_root: record.base_repo_root.clone(),
             remote_connection: record.remote_connection.clone(),
             created_at: record.created_at,
+            status: record.status.clone(),
+            ticket_type: record.ticket_type.clone(),
+            issue_id: record.issue_id.clone(),
+            body_markdown: record.body_markdown.clone(),
+            body_fetched_at: record.body_fetched_at,
         };
         self.tickets.insert(record.ticket_id.clone(), record);
         self.pending_ops_tx
@@ -289,6 +407,8 @@ impl TicketMetadataStore {
             .sessions
             .retain(|s| s.terminal_id != session.terminal_id);
         existing.sessions.push(session.clone());
+        self.sessions_by_terminal
+            .insert(session.terminal_id, ticket_id.clone());
         self.pending_ops_tx
             .try_send(DbOperation::UpsertSession {
                 ticket_id: ticket_id.clone(),
@@ -299,8 +419,67 @@ impl TicketMetadataStore {
         Ok(())
     }
 
+    /// Records that a session's terminal was resumed. Terminals that don't
+    /// belong to a ticket (plain agent-panel terminals share these call sites)
+    /// are ignored rather than treated as an error.
+    pub fn mark_session_resumed(
+        &mut self,
+        terminal_id: TerminalId,
+        at: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_session(terminal_id, cx, |session| {
+            session.last_resumed_at = Some(at);
+            session.ended_at = None;
+        });
+    }
+
+    /// Records that a session's terminal was closed. As with
+    /// [`Self::mark_session_resumed`], an unknown terminal is a no-op.
+    pub fn mark_session_ended(
+        &mut self,
+        terminal_id: TerminalId,
+        at: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_session(terminal_id, cx, |session| {
+            session.ended_at = Some(at);
+        });
+    }
+
+    fn update_session(
+        &mut self,
+        terminal_id: TerminalId,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut TicketSessionRecord),
+    ) {
+        let Some(ticket_id) = self.sessions_by_terminal.get(&terminal_id).cloned() else {
+            return;
+        };
+        let Some(record) = self.tickets.get_mut(&ticket_id) else {
+            return;
+        };
+        let Some(session) = record
+            .sessions
+            .iter_mut()
+            .find(|session| session.terminal_id == terminal_id)
+        else {
+            return;
+        };
+        update(session);
+        let session = session.clone();
+        self.pending_ops_tx
+            .try_send(DbOperation::UpsertSession { ticket_id, session })
+            .log_err();
+        cx.notify();
+    }
+
     pub fn delete_worktree(&mut self, ticket_id: &TicketId, cx: &mut Context<Self>) {
-        self.tickets.remove(ticket_id);
+        if let Some(record) = self.tickets.remove(ticket_id) {
+            for session in &record.sessions {
+                self.sessions_by_terminal.remove(&session.terminal_id);
+            }
+        }
         self.pending_ops_tx
             .try_send(DbOperation::DeleteWorktree(ticket_id.clone()))
             .log_err();
@@ -338,6 +517,7 @@ impl TicketMetadataStore {
         let mut this = Self {
             db,
             tickets: HashMap::default(),
+            sessions_by_terminal: HashMap::default(),
             pending_ops_tx: tx,
             _db_operations_task,
         };
@@ -378,6 +558,7 @@ impl TicketMetadataStore {
 
             this.update(cx, |this, cx| {
                 this.tickets.clear();
+                this.sessions_by_terminal.clear();
                 for row in worktrees {
                     this.tickets.insert(
                         row.ticket_id.clone(),
@@ -385,6 +566,11 @@ impl TicketMetadataStore {
                             ticket_id: row.ticket_id,
                             title: row.title,
                             url: row.url,
+                            status: row.status,
+                            ticket_type: row.ticket_type,
+                            issue_id: row.issue_id,
+                            body_markdown: row.body_markdown,
+                            body_fetched_at: row.body_fetched_at,
                             worktree_path: row.worktree_path,
                             branch_name: row.branch_name,
                             base_repo_root: row.base_repo_root,
@@ -396,6 +582,8 @@ impl TicketMetadataStore {
                 }
                 for (ticket_id, session) in sessions {
                     if let Some(record) = this.tickets.get_mut(&ticket_id) {
+                        this.sessions_by_terminal
+                            .insert(session.terminal_id, ticket_id.clone());
                         record.sessions.push(session);
                     }
                 }
@@ -412,28 +600,35 @@ struct TicketMetadataDb(ThreadSafeConnection);
 impl Domain for TicketMetadataDb {
     const NAME: &str = stringify!(TicketMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS ticket_worktrees(
-            ticket_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            url TEXT NOT NULL,
-            worktree_path TEXT,
-            branch_name TEXT,
-            base_repo_root TEXT,
-            remote_connection TEXT,
-            created_at TEXT NOT NULL
-        ) STRICT;
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS ticket_worktrees(
+                ticket_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL,
+                worktree_path TEXT,
+                branch_name TEXT,
+                base_repo_root TEXT,
+                remote_connection TEXT,
+                created_at TEXT NOT NULL
+            ) STRICT;
 
-        CREATE TABLE IF NOT EXISTS ticket_sessions(
-            terminal_id TEXT PRIMARY KEY,
-            ticket_id TEXT NOT NULL,
-            cc_session_id TEXT,
-            launch_kind TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            last_resumed_at TEXT,
-            ended_at TEXT
-        ) STRICT;
-    )];
+            CREATE TABLE IF NOT EXISTS ticket_sessions(
+                terminal_id TEXT PRIMARY KEY,
+                ticket_id TEXT NOT NULL,
+                cc_session_id TEXT,
+                launch_kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_resumed_at TEXT,
+                ended_at TEXT
+            ) STRICT;
+        ),
+        sql!(ALTER TABLE ticket_worktrees ADD COLUMN status TEXT),
+        sql!(ALTER TABLE ticket_worktrees ADD COLUMN ticket_type TEXT),
+        sql!(ALTER TABLE ticket_worktrees ADD COLUMN issue_id TEXT),
+        sql!(ALTER TABLE ticket_worktrees ADD COLUMN body_markdown TEXT),
+        sql!(ALTER TABLE ticket_worktrees ADD COLUMN body_fetched_at TEXT),
+    ];
 }
 
 db::static_connection!(TicketMetadataDb, []);
@@ -442,7 +637,8 @@ impl TicketMetadataDb {
     fn list_worktrees(&self) -> anyhow::Result<Vec<TicketWorktreeRow>> {
         self.select::<TicketWorktreeRow>(
             "SELECT ticket_id, title, url, worktree_path, branch_name, base_repo_root, \
-            remote_connection, created_at \
+            remote_connection, created_at, status, ticket_type, issue_id, body_markdown, \
+            body_fetched_at \
             FROM ticket_worktrees \
             ORDER BY created_at DESC",
         )?()
@@ -477,10 +673,15 @@ impl TicketMetadataDb {
             .transpose()
             .context("serialize ticket remote connection")?;
         let created_at = row.created_at.to_rfc3339();
+        let status = row.status.as_ref().map(ToString::to_string);
+        let ticket_type = row.ticket_type.as_ref().map(ToString::to_string);
+        let issue_id = row.issue_id.as_ref().map(ToString::to_string);
+        let body_markdown = row.body_markdown.clone();
+        let body_fetched_at = row.body_fetched_at.map(|time| time.to_rfc3339());
 
         self.write(move |conn| {
-            let sql = "INSERT INTO ticket_worktrees(ticket_id, title, url, worktree_path, branch_name, base_repo_root, remote_connection, created_at) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+            let sql = "INSERT INTO ticket_worktrees(ticket_id, title, url, worktree_path, branch_name, base_repo_root, remote_connection, created_at, status, ticket_type, issue_id, body_markdown, body_fetched_at) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                        ON CONFLICT(ticket_id) DO UPDATE SET \
                            title = excluded.title, \
                            url = excluded.url, \
@@ -488,7 +689,12 @@ impl TicketMetadataDb {
                            branch_name = excluded.branch_name, \
                            base_repo_root = excluded.base_repo_root, \
                            remote_connection = excluded.remote_connection, \
-                           created_at = excluded.created_at";
+                           created_at = excluded.created_at, \
+                           status = excluded.status, \
+                           ticket_type = excluded.ticket_type, \
+                           issue_id = excluded.issue_id, \
+                           body_markdown = excluded.body_markdown, \
+                           body_fetched_at = excluded.body_fetched_at";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&ticket_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -497,7 +703,12 @@ impl TicketMetadataDb {
             i = stmt.bind(&branch_name, i)?;
             i = stmt.bind(&base_repo_root, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&created_at, i)?;
+            i = stmt.bind(&created_at, i)?;
+            i = stmt.bind(&status, i)?;
+            i = stmt.bind(&ticket_type, i)?;
+            i = stmt.bind(&issue_id, i)?;
+            i = stmt.bind(&body_markdown, i)?;
+            stmt.bind(&body_fetched_at, i)?;
             stmt.exec()
         })
         .await
@@ -566,6 +777,11 @@ impl Column for TicketWorktreeRow {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (created_at, next): (String, i32) = Column::column(statement, next)?;
+        let (status, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (ticket_type, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (issue_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (body_markdown, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (body_fetched_at, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let remote_connection = remote_connection_json
             .as_deref()
@@ -583,6 +799,14 @@ impl Column for TicketWorktreeRow {
                 base_repo_root: base_repo_root.map(PathBuf::from),
                 remote_connection,
                 created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+                status: status.map(SharedString::from),
+                ticket_type: ticket_type.map(SharedString::from),
+                issue_id: issue_id.map(SharedString::from),
+                body_markdown,
+                body_fetched_at: body_fetched_at
+                    .map(|time| DateTime::parse_from_rfc3339(&time))
+                    .transpose()?
+                    .map(|time| time.with_timezone(&Utc)),
             },
             next,
         ))
@@ -654,11 +878,15 @@ async fn open_ticket_workspace(
 /// Runs `git gtr new <branch> --porcelain` in `repo_path`, which creates the
 /// worktree and runs any `.gtrconfig` post-create hooks (secrets fetch,
 /// dependency install, editor/AI config sync, etc.) before returning —
-/// https://github.com/coderabbitai/git-worktree-runner. `--porcelain` writes
-/// exactly `path`/`branch`/`hook_status` tab-separated records to stdout on
-/// success; a failed hook exits non-zero with no success records, so `gtr`
-/// itself is the single source of truth for whether the worktree is usable —
-/// no separate rollback step is needed here.
+/// https://github.com/coderabbitai/git-worktree-runner. A failed hook exits
+/// non-zero, so `gtr` itself is the single source of truth for whether the
+/// worktree is usable — no separate rollback step is needed here.
+///
+/// The resulting path is then looked up through `git gtr list` rather than read
+/// out of `new`'s own `path` record: `new` derives that record from the shell's
+/// working directory, which under Git for Windows is an MSYS path
+/// (`/c/Users/…`) that no Windows API accepts, whereas `list` reports the paths
+/// `git worktree list` does.
 async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<PathBuf> {
     let output = smol::process::Command::new("git")
         .args(["gtr", "new", branch_name, "--porcelain"])
@@ -668,15 +896,291 @@ async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<Path
         .context("failed to run `git gtr` — is git-worktree-runner installed and on PATH?")?;
 
     if !output.status.success() {
-        anyhow::bail!("git gtr new failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "git gtr new failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    String::from_utf8_lossy(&output.stdout)
+    let list = smol::process::Command::new("git")
+        .args(["gtr", "list", "--porcelain"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .context("failed to run `git gtr list`")?;
+
+    if !list.status.success() {
+        anyhow::bail!(
+            "git gtr list failed: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+    }
+
+    worktree_path_for_branch(&String::from_utf8_lossy(&list.stdout), branch_name)
+        .with_context(|| format!("git gtr list did not report a worktree for branch {branch_name}"))
+}
+
+/// Picks a branch's worktree path out of `git gtr list --porcelain` output,
+/// whose records are `<path>\t<branch>\t<hook_status>`.
+fn worktree_path_for_branch(list_output: &str, branch_name: &str) -> Option<PathBuf> {
+    list_output
         .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .find(|(key, _)| *key == "path")
-        .map(|(_, value)| PathBuf::from(value))
-        .context("git gtr new --porcelain did not report a worktree path")
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            Some((fields.next()?, fields.next()?))
+        })
+        .find(|(_, branch)| *branch == branch_name)
+        .map(|(path, _)| PathBuf::from(path))
+}
+
+/// The per-worktree mirror directory for a ticket's brief and attachments.
+///
+/// `@` mentions are whitespace-delimited **by Claude itself**, so no amount of
+/// shell quoting rescues a path containing a space — and the canonical copy
+/// lives under `paths::data_dir()`, whose Windows account-name component very
+/// often has one. Mirroring into the worktree lets the launch command point at
+/// the files with short, relative, space-free paths, which works because the
+/// ticket terminal's working directory already *is* the worktree.
+const WORKTREE_MIRROR_DIR: &str = ".zed-ticket";
+const BRIEF_FILE_NAME: &str = "brief.md";
+
+/// Ticket ids are Notion URL path segments, so they can carry separators and
+/// other characters a file name cannot; used raw, one would escape the
+/// tickets directory.
+pub fn sanitize_ticket_id(ticket_id: &str) -> String {
+    let sanitized: String = ticket_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-').to_string();
+    if sanitized.is_empty() {
+        "ticket".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// The canonical, worktree-independent home for a ticket's brief and its
+/// attachments. It deliberately outlives the worktree: the mirror is rebuilt
+/// from here on every resume, so a `git clean` or a recut worktree never
+/// strands the transcript's references.
+pub fn ticket_data_dir(ticket_id: &TicketId) -> PathBuf {
+    paths::data_dir()
+        .join("tickets")
+        .join(sanitize_ticket_id(&ticket_id.0))
+}
+
+/// Where pasted screenshots for a ticket are kept.
+pub fn ticket_images_dir(ticket_id: &TicketId) -> PathBuf {
+    ticket_data_dir(ticket_id).join("images")
+}
+
+/// What the launch modal produces: the reviewed brief plus the absolute paths
+/// of the attachments it saved under [`ticket_images_dir`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TicketLaunchSpec {
+    pub brief_markdown: String,
+    pub attachments: Vec<PathBuf>,
+}
+
+/// What the launch command references: worktree-relative paths into
+/// [`WORKTREE_MIRROR_DIR`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TicketLaunchFiles {
+    pub brief_relative_path: String,
+    pub attachment_relative_paths: Vec<String>,
+}
+
+/// Writes the brief and attachments to their canonical location and mirrors
+/// them into the worktree, returning the relative paths the launch command
+/// should mention.
+///
+/// Idempotent, so it doubles as the self-heal step on resume.
+///
+/// The mention paths this returns are space-free *by construction*, which is
+/// the whole point of the mirror: `@` mentions are split on whitespace by
+/// Claude itself, and a mention whose path contains a space loads nothing at
+/// all — with no error and no warning (verified against the real CLI with
+/// `--disallowed-tools Read Glob Grep Bash`, which is required to observe it:
+/// with tools enabled Claude just reads the file and the breakage is masked).
+/// Every component of the returned paths is chosen here — the literal
+/// `.zed-ticket`, the literal `brief.md`, and file names run through
+/// [`mentionable_file_name`] — so the only place a space *could* come from is
+/// the worktree path, and the worktree path never appears in a mention.
+async fn materialize_brief(
+    fs: &Arc<dyn Fs>,
+    ticket_id: &TicketId,
+    worktree_path: &Path,
+    spec: &TicketLaunchSpec,
+) -> anyhow::Result<TicketLaunchFiles> {
+    let mirror_dir = worktree_path.join(WORKTREE_MIRROR_DIR);
+    fs.create_dir(&mirror_dir)
+        .await
+        .with_context(|| format!("failed to create {}", mirror_dir.display()))?;
+
+    let mut attachment_relative_paths = Vec::with_capacity(spec.attachments.len());
+    let mut read_with_tool_paths = Vec::new();
+    for attachment in &spec.attachments {
+        let file_name = attachment
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("attachment {} has no file name", attachment.display()))?;
+        let file_name = mentionable_file_name(file_name);
+        fs.copy_file(
+            attachment,
+            &mirror_dir.join(&file_name),
+            fs::CopyOptions {
+                overwrite: true,
+                ignore_if_exists: false,
+            },
+        )
+        .await
+        .with_context(|| format!("failed to mirror attachment {}", attachment.display()))?;
+
+        let relative_path = format!("{WORKTREE_MIRROR_DIR}/{file_name}");
+        // Belt and braces: `mentionable_file_name` cannot leave whitespace in,
+        // but losing a pasted screenshot silently is the worst outcome here, so
+        // anything unmentionable is handed to Claude as a Read instruction
+        // rather than dropped.
+        if relative_path.contains(char::is_whitespace) {
+            read_with_tool_paths.push(relative_path);
+        } else {
+            attachment_relative_paths.push(relative_path);
+        }
+    }
+
+    let brief_markdown = brief_with_read_fallback(&spec.brief_markdown, &read_with_tool_paths);
+
+    let canonical_dir = ticket_data_dir(ticket_id);
+    fs.create_dir(&canonical_dir)
+        .await
+        .with_context(|| format!("failed to create {}", canonical_dir.display()))?;
+    fs.atomic_write(canonical_dir.join(BRIEF_FILE_NAME), brief_markdown.clone())
+        .await
+        .context("failed to write the ticket brief")?;
+    fs.atomic_write(mirror_dir.join(BRIEF_FILE_NAME), brief_markdown)
+        .await
+        .context("failed to mirror the ticket brief into the worktree")?;
+
+    Ok(TicketLaunchFiles {
+        brief_relative_path: format!("{WORKTREE_MIRROR_DIR}/{BRIEF_FILE_NAME}"),
+        attachment_relative_paths,
+    })
+}
+
+/// Makes a file name safe to appear inside an `@` mention: whitespace ends the
+/// mention, so it is folded away rather than escaped (no escaping mechanism
+/// exists on Claude's side).
+fn mentionable_file_name(file_name: &str) -> String {
+    let collapsed = file_name
+        .chars()
+        .map(|character| {
+            if character.is_whitespace() {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if collapsed.is_empty() {
+        "attachment".to_string()
+    } else {
+        collapsed
+    }
+}
+
+/// Appends the paths that could not be `@`-mentioned to the brief, so Claude
+/// opens them with its Read tool instead of never seeing them.
+fn brief_with_read_fallback(brief_markdown: &str, read_with_tool_paths: &[String]) -> String {
+    if read_with_tool_paths.is_empty() {
+        return brief_markdown.to_string();
+    }
+    let mut brief = brief_markdown.to_string();
+    if !brief.ends_with('\n') {
+        brief.push('\n');
+    }
+    brief.push_str("\n## Attachments to open with the Read tool\n");
+    for path in read_with_tool_paths {
+        brief.push_str(&format!("- {path}\n"));
+    }
+    brief
+}
+
+/// Hides the mirror from git via `info/exclude` in the *common* git dir,
+/// which every linked worktree of the repository shares — so one write covers
+/// them all — rather than the tracked `.gitignore`, which belongs to the user.
+async fn exclude_mirror_from_git(fs: &Arc<dyn Fs>, worktree_path: &Path) -> anyhow::Result<()> {
+    let output = smol::process::Command::new("git")
+        .args(["-C"])
+        .arg(worktree_path)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .await
+        .context("failed to locate the repository's common git directory")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git rev-parse --git-common-dir failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let common_dir = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .context("git rev-parse returned non-UTF-8 output")?
+            .trim(),
+    );
+    let info_dir = common_dir.join("info");
+    fs.create_dir(&info_dir)
+        .await
+        .with_context(|| format!("failed to create {}", info_dir.display()))?;
+
+    let exclude_path = info_dir.join("exclude");
+    let existing = fs.load(&exclude_path).await.unwrap_or_default();
+    let entry = format!("{WORKTREE_MIRROR_DIR}/");
+    if existing.lines().any(|line| line.trim() == entry) {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&entry);
+    updated.push('\n');
+    fs.atomic_write(exclude_path.clone(), updated)
+        .await
+        .with_context(|| format!("failed to update {}", exclude_path.display()))
+}
+
+/// Rebuilds a [`TicketLaunchSpec`] from the canonical copy on disk, for
+/// resuming a ticket whose brief was written by an earlier launch.
+async fn launch_spec_from_canonical(
+    fs: &Arc<dyn Fs>,
+    ticket_id: &TicketId,
+) -> anyhow::Result<TicketLaunchSpec> {
+    let brief_markdown = fs
+        .load(&ticket_data_dir(ticket_id).join(BRIEF_FILE_NAME))
+        .await
+        .context("this ticket has no stored brief to restore")?;
+
+    let images_dir = ticket_images_dir(ticket_id);
+    let mut attachments = Vec::new();
+    if let Ok(mut entries) = fs.read_dir(&images_dir).await {
+        while let Some(entry) = futures::StreamExt::next(&mut entries).await {
+            attachments.push(entry?);
+        }
+    }
+    attachments.sort();
+
+    Ok(TicketLaunchSpec {
+        brief_markdown,
+        attachments,
+    })
 }
 
 /// Spawns a fresh `claude` CLI session for a ticket in the given worktree,
@@ -684,7 +1188,7 @@ async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<Path
 async fn launch_ticket_session(
     ticket_id: TicketId,
     worktree_path: PathBuf,
-    seeded_message: String,
+    launch_files: TicketLaunchFiles,
     launch_kind: TicketLaunchKind,
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
@@ -696,26 +1200,30 @@ async fn launch_ticket_session(
 
     window.update(cx, |_multi_workspace, window, cx| {
         agent_panel.update(cx, |panel, cx| {
-            panel.spawn_ticket_terminal(ticket_id, launch_kind, seeded_message, window, cx)
+            panel.spawn_ticket_terminal(ticket_id, launch_kind, launch_files, window, cx)
         })
-    })?;
-    Ok(())
+    })?
 }
 
 /// Creates a git worktree for a ticket via `git gtr new` (running any
-/// `.gtrconfig` post-create hooks) in the configured `repo_path`, persists
-/// the result into `TicketMetadataStore`, then launches the ticket's initial
-/// Claude Code session in it. `ticket_id` must already have an entry in
-/// `TicketMetadataStore` (from a prior `upsert_ticket_ref` sync).
+/// `.gtrconfig` post-create hooks) in `repo_path`, persists the result into
+/// `TicketMetadataStore`, writes out the ticket's brief, then launches the
+/// ticket's initial Claude Code session in the worktree. `ticket_id` must
+/// already have an entry in `TicketMetadataStore` (from a prior
+/// `upsert_ticket_ref` sync).
 pub async fn create_worktree_and_launch(
     ticket_id: TicketId,
     repo_path: PathBuf,
     branch_name: String,
-    seeded_message: String,
+    spec: TicketLaunchSpec,
+    fs: Arc<dyn Fs>,
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
     let worktree_path = run_gtr_new(&repo_path, &branch_name).await?;
+    // Hiding the mirror from git is a courtesy, not a precondition: a
+    // repository layout that defeats it must not stop the session launching.
+    exclude_mirror_from_git(&fs, &worktree_path).await.log_err();
 
     let ticket_store = cx.update(|cx| TicketMetadataStore::global(cx));
     ticket_store.update(cx, |store, cx| {
@@ -729,10 +1237,12 @@ pub async fn create_worktree_and_launch(
         )
     })?;
 
+    let launch_files = materialize_brief(&fs, &ticket_id, &worktree_path, &spec).await?;
+
     launch_ticket_session(
         ticket_id,
         worktree_path,
-        seeded_message,
+        launch_files,
         TicketLaunchKind::Initial,
         app_state,
         cx,
@@ -745,8 +1255,13 @@ pub async fn create_worktree_and_launch(
 /// `claude --resume <id>` (built by `AgentPanel::restore_terminal`'s
 /// resume-command logic — this call site does not construct the command
 /// itself).
+///
+/// The resumed transcript still refers to `.zed-ticket/brief.md`, so the
+/// mirror is rebuilt from the canonical copy first; a `git clean` between
+/// sessions would otherwise leave those references dangling.
 pub async fn open_ticket(
     ticket_id: TicketId,
+    fs: Arc<dyn Fs>,
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
@@ -766,6 +1281,10 @@ pub async fn open_ticket(
         anyhow::Ok((worktree_path, terminal_id))
     })?;
 
+    if let Ok(spec) = launch_spec_from_canonical(&fs, &ticket_id).await {
+        materialize_brief(&fs, &ticket_id, &worktree_path, &spec).await?;
+    }
+
     let (window, workspace) = open_ticket_workspace(worktree_path, app_state, cx).await?;
     let agent_panel = workspace
         .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
@@ -773,7 +1292,9 @@ pub async fn open_ticket(
 
     let terminal_metadata = cx
         .update(|cx| TerminalThreadMetadataStore::global(cx))
-        .read_with(cx, |store, _cx| store.entry(most_recent_terminal_id).cloned())
+        .read_with(cx, |store, _cx| {
+            store.entry(most_recent_terminal_id).cloned()
+        })
         .context("no persisted metadata for the ticket's most recent session")?;
 
     window.update(cx, |_multi_workspace, window, cx| {
@@ -795,7 +1316,8 @@ pub async fn open_ticket(
 /// that already has a worktree (and possibly other sessions running).
 pub async fn launch_additional_session(
     ticket_id: TicketId,
-    seeded_message: String,
+    spec: TicketLaunchSpec,
+    fs: Arc<dyn Fs>,
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
@@ -808,10 +1330,12 @@ pub async fn launch_additional_session(
         })
         .context("ticket has no worktree yet")?;
 
+    let launch_files = materialize_brief(&fs, &ticket_id, &worktree_path, &spec).await?;
+
     launch_ticket_session(
         ticket_id,
         worktree_path,
-        seeded_message,
+        launch_files,
         TicketLaunchKind::Additional,
         app_state,
         cx,
@@ -831,6 +1355,167 @@ mod tests {
         cx.run_until_parked();
     }
 
+    #[test]
+    fn test_sanitize_ticket_id_cannot_escape_the_tickets_directory() {
+        assert_eq!(
+            sanitize_ticket_id("Fix-chart-0123abcd"),
+            "Fix-chart-0123abcd"
+        );
+        assert_eq!(sanitize_ticket_id("../../etc/passwd"), "etc-passwd");
+        assert_eq!(sanitize_ticket_id("///"), "ticket");
+    }
+
+    #[test]
+    fn test_mentionable_file_name_folds_whitespace_away() {
+        // `@` mentions are whitespace-delimited with no escaping, so a name
+        // like this must not reach a mention intact.
+        assert_eq!(
+            mentionable_file_name("Screenshot 2026-08-21 101400.png"),
+            "Screenshot-2026-08-21-101400.png"
+        );
+        assert_eq!(mentionable_file_name("img-1.png"), "img-1.png");
+        assert_eq!(mentionable_file_name(""), "attachment");
+    }
+
+    #[test]
+    fn test_brief_gains_a_read_fallback_for_unmentionable_paths() {
+        assert_eq!(brief_with_read_fallback("# Ticket\n", &[]), "# Ticket\n");
+        assert_eq!(
+            brief_with_read_fallback("# Ticket", &[".zed-ticket/a b.png".to_string()]),
+            "# Ticket\n\n## Attachments to open with the Read tool\n- .zed-ticket/a b.png\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_materialize_brief_produces_space_free_mentions(cx: &mut TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let ticket_id = TicketId::new("CT-1487");
+        let worktree_path = PathBuf::from(util::path!("/repos/my repo-worktrees/fix"));
+        let source_dir = PathBuf::from(util::path!("/downloads"));
+        fs.create_dir(&source_dir).await.unwrap();
+        fs.write(&source_dir.join("a shot.png"), b"pixels")
+            .await
+            .unwrap();
+
+        let spec = TicketLaunchSpec {
+            brief_markdown: "# Ticket: spaces everywhere\n".to_string(),
+            attachments: vec![source_dir.join("a shot.png")],
+        };
+        let fs: Arc<dyn Fs> = fs;
+        let files = materialize_brief(&fs, &ticket_id, &worktree_path, &spec)
+            .await
+            .expect("materializing should succeed");
+
+        // The worktree path has a space in it; the mention must not.
+        assert_eq!(
+            files.attachment_relative_paths,
+            vec![".zed-ticket/a-shot.png".to_string()]
+        );
+        assert!(!files.brief_relative_path.contains(char::is_whitespace));
+        assert_eq!(
+            fs.load_bytes(&worktree_path.join(".zed-ticket").join("a-shot.png"))
+                .await
+                .unwrap(),
+            b"pixels"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_materialize_brief_mirrors_into_the_worktree(cx: &mut TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let ticket_id = TicketId::new("Fix-the-chart-0123");
+        let worktree_path = PathBuf::from(util::path!("/repos/inox-worktrees/fix-the-chart"));
+        let images_dir = ticket_images_dir(&ticket_id);
+        fs.create_dir(&images_dir).await.unwrap();
+        fs.write(&images_dir.join("img-1.png"), b"first")
+            .await
+            .unwrap();
+        fs.write(&images_dir.join("img-2.png"), b"second")
+            .await
+            .unwrap();
+
+        let spec = TicketLaunchSpec {
+            brief_markdown: "# Ticket: Fix the chart\n".to_string(),
+            attachments: vec![images_dir.join("img-1.png"), images_dir.join("img-2.png")],
+        };
+
+        let fs: Arc<dyn Fs> = fs;
+        let files = materialize_brief(&fs, &ticket_id, &worktree_path, &spec)
+            .await
+            .expect("materializing the brief should succeed");
+
+        assert_eq!(files.brief_relative_path, ".zed-ticket/brief.md");
+        assert_eq!(
+            files.attachment_relative_paths,
+            vec![
+                ".zed-ticket/img-1.png".to_string(),
+                ".zed-ticket/img-2.png".to_string()
+            ]
+        );
+
+        let mirror = worktree_path.join(".zed-ticket");
+        assert_eq!(
+            fs.load(&mirror.join("brief.md")).await.unwrap(),
+            spec.brief_markdown
+        );
+        assert_eq!(
+            fs.load_bytes(&mirror.join("img-1.png")).await.unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            fs.load_bytes(&mirror.join("img-2.png")).await.unwrap(),
+            b"second"
+        );
+
+        // The canonical copy survives the worktree, so a resume can rebuild
+        // the mirror from it.
+        let canonical = ticket_data_dir(&ticket_id).join("brief.md");
+        assert_eq!(fs.load(&canonical).await.unwrap(), spec.brief_markdown);
+
+        let restored = launch_spec_from_canonical(&fs, &ticket_id)
+            .await
+            .expect("the canonical copy should be readable back");
+        assert_eq!(restored.brief_markdown, spec.brief_markdown);
+        assert_eq!(restored.attachments, spec.attachments);
+    }
+
+    #[test]
+    fn test_worktree_path_for_branch() {
+        let list_output = concat!(
+            "C:/Users/dev/repo\tmaster\tok\n",
+            "C:/Users/dev/repo-worktrees/spider-fix\tspider-fix\tok\n",
+        );
+
+        assert_eq!(
+            worktree_path_for_branch(list_output, "spider-fix"),
+            Some(PathBuf::from("C:/Users/dev/repo-worktrees/spider-fix"))
+        );
+        assert_eq!(
+            worktree_path_for_branch(list_output, "master"),
+            Some(PathBuf::from("C:/Users/dev/repo"))
+        );
+        assert_eq!(worktree_path_for_branch(list_output, "spider"), None);
+        assert_eq!(worktree_path_for_branch("", "spider-fix"), None);
+    }
+
+    fn display_fields(title: &str, url: &str, status: Option<&str>) -> TicketDisplayFields {
+        TicketDisplayFields {
+            title: title.to_string().into(),
+            url: url.to_string().into(),
+            status: status.map(|status| status.to_string().into()),
+            ticket_type: None,
+            issue_id: None,
+        }
+    }
+
+    #[test]
+    fn test_status_rank() {
+        assert_eq!(status_rank(Some(&"3 - In progress".into())), 3);
+        assert_eq!(status_rank(Some(&"10 - Done".into())), 10);
+        assert_eq!(status_rank(Some(&"Backlog".into())), u32::MAX);
+        assert_eq!(status_rank(None), u32::MAX);
+    }
+
     #[gpui::test]
     async fn test_upsert_and_save_worktree_round_trip(cx: &mut TestAppContext) {
         init_test(cx);
@@ -840,11 +1525,24 @@ mod tests {
             TicketMetadataStore::global(cx).update(cx, |store, cx| {
                 store.upsert_ticket_ref(
                     ticket_id.clone(),
-                    "Fix invoice export".into(),
-                    "https://notion.so/ticket-1".into(),
+                    TicketDisplayFields {
+                        title: "Fix invoice export".into(),
+                        url: "https://notion.so/ticket-1".into(),
+                        status: Some("3 - In progress".into()),
+                        ticket_type: Some("Bug".into()),
+                        issue_id: Some("CT-1487".into()),
+                    },
                     cx,
                 );
             });
+        });
+
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx)
+                .update(cx, |store, cx| {
+                    store.save_body(&ticket_id, "# Repro steps".to_string(), cx)
+                })
+                .expect("ticket should be present");
         });
 
         cx.update(|cx| {
@@ -875,6 +1573,41 @@ mod tests {
                 entry.branch_name.as_deref(),
                 Some("ticket/fix-invoice-export")
             );
+            assert_eq!(entry.status.as_deref(), Some("3 - In progress"));
+            assert_eq!(entry.ticket_type.as_deref(), Some("Bug"));
+            assert_eq!(entry.issue_id.as_deref(), Some("CT-1487"));
+            assert_eq!(entry.body_markdown.as_deref(), Some("# Repro steps"));
+            assert!(entry.body_fetched_at.is_some());
+        });
+
+        // A later board sync refreshes the display fields but must not drop
+        // the lazily fetched page body.
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx).update(cx, |store, cx| {
+                store.upsert_ticket_ref(
+                    ticket_id.clone(),
+                    display_fields(
+                        "Fix invoice export v2",
+                        "https://notion.so/ticket-1",
+                        Some("4 - Review"),
+                    ),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TicketMetadataStore::global(cx);
+            let store = store.read(cx);
+            let entry = store.entry(&ticket_id).expect("ticket should be present");
+            assert_eq!(entry.title.as_ref(), "Fix invoice export v2");
+            assert_eq!(entry.status.as_deref(), Some("4 - Review"));
+            assert_eq!(entry.ticket_type, None);
+            assert_eq!(entry.body_markdown.as_deref(), Some("# Repro steps"));
+            assert_eq!(
+                entry.worktree_path,
+                Some(PathBuf::from("/worktrees/fix-invoice-export"))
+            );
         });
 
         // Reload from the database to confirm persistence, not just the
@@ -884,6 +1617,68 @@ mod tests {
         let rows = db.list_worktrees().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ticket_id, ticket_id);
+        assert_eq!(rows[0].status.as_deref(), Some("4 - Review"));
+        assert_eq!(rows[0].ticket_type, None);
+        assert_eq!(rows[0].issue_id, None);
+        assert_eq!(rows[0].body_markdown.as_deref(), Some("# Repro steps"));
+        assert!(rows[0].body_fetched_at.is_some());
+    }
+
+    #[gpui::test]
+    async fn test_entries_sorted(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx).update(cx, |store, cx| {
+                store.upsert_ticket_ref(
+                    TicketId::new("page-c"),
+                    display_fields("Zebra", "https://notion.so/c", Some("3 - In progress")),
+                    cx,
+                );
+                store.upsert_ticket_ref(
+                    TicketId::new("page-a"),
+                    display_fields("Apple", "https://notion.so/a", Some("3 - In progress")),
+                    cx,
+                );
+                store.upsert_ticket_ref(
+                    TicketId::new("page-b"),
+                    display_fields("Mango", "https://notion.so/b", Some("1 - Backlog")),
+                    cx,
+                );
+                store.upsert_ticket_ref(
+                    TicketId::new("page-d"),
+                    display_fields("Anteater", "https://notion.so/d", Some("Icebox")),
+                    cx,
+                );
+                store.upsert_ticket_ref(
+                    TicketId::new("page-e"),
+                    display_fields("Anteater", "https://notion.so/e", None),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TicketMetadataStore::global(cx);
+            let store = store.read(cx);
+            let titles: Vec<_> = store
+                .entries_sorted()
+                .iter()
+                .map(|entry| entry.title.to_string())
+                .collect();
+            assert_eq!(
+                titles,
+                vec!["Mango", "Apple", "Zebra", "Anteater", "Anteater"]
+            );
+
+            let unranked: Vec<_> = store
+                .entries_sorted()
+                .iter()
+                .skip(3)
+                .map(|entry| entry.ticket_id.0.to_string())
+                .collect();
+            assert_eq!(unranked, vec!["page-d", "page-e"]);
+        });
     }
 
     #[gpui::test]
@@ -895,8 +1690,7 @@ mod tests {
             TicketMetadataStore::global(cx).update(cx, |store, cx| {
                 store.upsert_ticket_ref(
                     ticket_id.clone(),
-                    "Add dark mode".into(),
-                    "https://notion.so/ticket-2".into(),
+                    display_fields("Add dark mode", "https://notion.so/ticket-2", None),
                     cx,
                 );
             });
@@ -928,10 +1722,68 @@ mod tests {
             let entry = store.entry(&ticket_id).expect("ticket should be present");
             assert_eq!(entry.sessions.len(), 1);
             assert_eq!(
-                entry.most_recent_session().unwrap().cc_session_id.as_deref(),
+                entry
+                    .most_recent_session()
+                    .unwrap()
+                    .cc_session_id
+                    .as_deref(),
                 Some("session-uuid")
             );
+            assert_eq!(entry.unclosed_session_count(), 1);
+            assert_eq!(store.ticket_id_for_terminal(terminal_id), Some(&ticket_id));
+            assert_eq!(
+                store
+                    .session_for_terminal(terminal_id)
+                    .and_then(|session| session.cc_session_id.as_deref()),
+                Some("session-uuid")
+            );
+            assert!(store.ticket_id_for_terminal(TerminalId::new()).is_none());
         });
+
+        let resumed_at = Utc::now();
+        let ended_at = resumed_at + chrono::Duration::seconds(30);
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx).update(cx, |store, cx| {
+                store.mark_session_resumed(terminal_id, resumed_at, cx);
+                // Terminals that never belonged to a ticket must be ignored,
+                // not reported as an error.
+                store.mark_session_ended(TerminalId::new(), ended_at, cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TicketMetadataStore::global(cx);
+            let store = store.read(cx);
+            let session = store
+                .session_for_terminal(terminal_id)
+                .expect("session should be indexed");
+            assert_eq!(session.last_resumed_at, Some(resumed_at));
+            assert_eq!(session.ended_at, None);
+        });
+
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx).update(cx, |store, cx| {
+                store.mark_session_ended(terminal_id, ended_at, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = TicketMetadataStore::global(cx);
+            let store = store.read(cx);
+            let session = store
+                .session_for_terminal(terminal_id)
+                .expect("session should be indexed");
+            assert_eq!(session.ended_at, Some(ended_at));
+            let entry = store.entry(&ticket_id).expect("ticket should be present");
+            assert_eq!(entry.unclosed_session_count(), 0);
+        });
+
+        let db = cx.update(|cx| TicketMetadataStore::global(cx).read(cx).db.clone());
+        let persisted = db.list_sessions().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].1.ended_at, Some(ended_at));
+        assert_eq!(persisted[0].1.last_resumed_at, Some(resumed_at));
 
         cx.update(|cx| {
             TicketMetadataStore::global(cx).update(cx, |store, cx| {
@@ -944,10 +1796,12 @@ mod tests {
             let store = TicketMetadataStore::global(cx);
             let store = store.read(cx);
             assert!(store.entry(&ticket_id).is_none());
+            assert!(store.ticket_id_for_terminal(terminal_id).is_none());
+            assert!(store.session_for_terminal(terminal_id).is_none());
         });
 
-        let db = cx.update(|cx| TicketMetadataStore::global(cx).read(cx).db.clone());
         cx.run_until_parked();
         assert!(db.list_worktrees().unwrap().is_empty());
+        assert!(db.list_sessions().unwrap().is_empty());
     }
 }

@@ -3,9 +3,11 @@ mod ai_setting_item;
 mod configured_api_card;
 mod skills_illustration;
 mod thread_item;
+mod ticket_item;
 
 pub use agent_setup_button::*;
 pub use ai_setting_item::*;
 pub use configured_api_card::*;
 pub use skills_illustration::*;
 pub use thread_item::*;
+pub use ticket_item::*;

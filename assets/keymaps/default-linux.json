@@ -1056,6 +1056,21 @@
     },
   },
   {
+    "context": "TicketLaunch",
+    "bindings": {
+      "escape": "menu::Cancel",
+      "ctrl-enter": "tickets::LaunchTicket",
+    },
+  },
+  {
+    "context": "TicketLaunch > Editor && mode == auto_height",
+    "bindings": {
+      "enter": "editor::Newline",
+      "escape": "menu::Cancel",
+      "ctrl-enter": "tickets::LaunchTicket",
+    },
+  },
+  {
     "context": "GitCommit > Editor && mode == auto_height",
     "bindings": {
       "escape": "menu::Cancel",

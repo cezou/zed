@@ -1169,18 +1169,12 @@ pub struct OutlinePanelSettingsContent {
     pub expand_outlines_with_depth: Option<usize>,
 }
 
+/// Settings for the `ticket_sync` crate. Named after the `tickets_panel`
+/// settings key, which outlived the dock panel it was introduced for:
+/// renaming the key would silently unconfigure existing settings files.
 #[with_fallible_options]
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
 pub struct TicketsPanelSettingsContent {
-    /// The position of the tickets panel.
-    ///
-    /// Default: right
-    pub dock: Option<DockSide>,
-    /// Customize default width (in pixels) taken by the tickets panel.
-    ///
-    /// Default: 300
-    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
-    pub default_width: Option<f32>,
     /// Notion database id for the ticket board, resolved once via the
     /// "notion: Resolve Database" command from a page id/URL.
     ///
@@ -1214,8 +1208,19 @@ pub struct TicketsPanelSettingsContent {
     /// Absolute path to the main worktree of the repository new ticket
     /// worktrees are cut from.
     ///
+    /// Deprecated: superseded by `repositories`, which supports more than
+    /// one repository. A value here is migrated into `repositories` the
+    /// first time the launch modal reads the registry.
+    ///
     /// Default: null
     pub repo_path: Option<String>,
+    /// Repositories the ticket launch modal can cut a worktree from. The
+    /// most-recently-used one is preselected; that ordering lives in the
+    /// key-value store rather than here, so opening a ticket never rewrites
+    /// settings.json.
+    ///
+    /// Default: []
+    pub repositories: Option<Vec<TicketRepositoryContent>>,
     /// Notion data source url (`collection://<uuid>`) for the ticket board,
     /// resolved via the OAuth/MCP connection ("notion: Connect to Notion")
     /// when Personal Access Tokens aren't permitted in your workspace.
@@ -1232,11 +1237,28 @@ pub struct TicketsPanelSettingsContent {
     ///
     /// Default: null
     pub notion_person_property: Option<String>,
+    /// Name of the board's `unique_id` property (what Notion renders as
+    /// e.g. `CT-1487`), as discovered over OAuth/MCP. Null when the board has
+    /// no such property.
+    ///
+    /// Default: null
+    pub notion_issue_id_property: Option<String>,
     /// Name of the Notion view (e.g. "Team Board") whose status filter
     /// should be mirrored when discovering the board over OAuth/MCP.
     ///
     /// Default: "Team Board"
     pub notion_board_view_name: Option<String>,
+}
+
+/// One repository the ticket launch modal offers as a worktree base.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct TicketRepositoryContent {
+    /// Absolute path to the repository's main worktree.
+    pub path: String,
+    /// Name to show in the repository dropdown. Defaults to the directory's
+    /// own file name when absent.
+    pub name: Option<String>,
 }
 
 #[derive(

@@ -988,11 +988,9 @@
     // Set to 0 to collapse all items that have children, 1 or higher to collapse items at that depth or deeper.
     "expand_outlines_with_depth": 100,
   },
+  // Notion ticket sync. The key is still named "tickets_panel" for backwards
+  // compatibility with existing user settings files.
   "tickets_panel": {
-    // Where to dock the tickets panel. Can be 'left' or 'right'.
-    "dock": "right",
-    // Default width of the tickets panel.
-    "default_width": 300,
     // Notion database id for the ticket board, resolved once via the
     // "notion: Resolve Database" command from a page id/URL.
     "notion_database_id": null,
@@ -1008,9 +1006,13 @@
     "notion_assignee_property": null,
     // How often to refresh the ticket list from Notion, in seconds.
     "refresh_interval_secs": 300,
-    // Absolute path to the main worktree of the repository new ticket
-    // worktrees are cut from.
+    // Deprecated: use "repositories" instead. Absolute path to the main
+    // worktree of the repository new ticket worktrees are cut from; migrated
+    // into "repositories" on first use.
     "repo_path": null,
+    // Repositories the ticket launch modal can cut a worktree from, as
+    // { "path": "...", "name": "..." } objects ("name" is optional).
+    "repositories": [],
     // Notion data source url (collection://<uuid>), resolved via
     // "notion: Connect to Notion" (OAuth/MCP) when Personal Access Tokens
     // aren't permitted in your workspace.
@@ -1021,6 +1023,9 @@
     // Name of the person-type property used to filter tickets assigned to
     // you, as discovered from the configured view.
     "notion_person_property": null,
+    // Name of the `unique_id` property (rendered as e.g. "CT-1487"), as
+    // discovered over OAuth/MCP. Null when the board has no such property.
+    "notion_issue_id_property": null,
     // Name of the Notion view whose status filter should be mirrored when
     // discovering the board over OAuth/MCP.
     "notion_board_view_name": "Team Board",
@@ -1121,6 +1126,8 @@
     "flexible": true,
     // Where to position the threads sidebar. Can be 'left' or 'right'.
     "sidebar_side": "left",
+    // Whether to show Zed's own agent threads in the threads sidebar.
+    "show_zed_agent_threads": false,
     // Default width when the agent panel is docked to the left or right.
     "default_width": 640,
     // Default height when the agent panel is docked to the bottom.

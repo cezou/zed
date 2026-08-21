@@ -42,10 +42,10 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     terminal_title_without_prefix,
 };
-use crate::ticket_metadata_store::{
-    TicketId, TicketLaunchKind, TicketMetadataStore, TicketSessionRecord,
-};
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::ticket_metadata_store::{
+    TicketId, TicketLaunchFiles, TicketLaunchKind, TicketMetadataStore, TicketSessionRecord,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -98,6 +98,7 @@ use ui::{
     PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
+use util::shell::ShellKind;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
     ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
@@ -187,8 +188,54 @@ impl fmt::Display for TerminalId {
 
 /// POSIX single-quotes `value` for safe use as one shell argument (embedded
 /// single quotes are closed, escaped, and reopened: `'\''`).
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+fn shell_quote(value: &str, shell_kind: ShellKind) -> Option<String> {
+    shell_kind
+        .try_quote(value)
+        .map(|quoted| quoted.into_owned())
+}
+
+/// Collapses a seeded agent prompt onto a single line. Prompts are delivered
+/// to the shell as keystrokes terminated by one CR (see
+/// [`AgentPanel::terminal_init_command_input`]), so an embedded newline would
+/// submit the line early — PowerShell in particular then drops into
+/// continuation mode and interprets the remainder as its own command.
+fn single_line_prompt(prompt: &str) -> String {
+    prompt
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" — ")
+}
+
+/// The prompt handed to `claude` when a ticket session starts. Every path in
+/// it is relative to the worktree, which is the terminal's working directory:
+/// Claude splits `@` mentions on whitespace itself, so an absolute path
+/// through a data directory whose name contains a space would be truncated no
+/// matter how the shell quoting is done.
+fn ticket_launch_prompt(launch_files: &TicketLaunchFiles) -> String {
+    let mut prompt = format!(
+        "Read {} and start working on it.",
+        launch_files.brief_relative_path
+    );
+    for attachment in &launch_files.attachment_relative_paths {
+        prompt.push_str(&format!(" @{attachment}"));
+    }
+    prompt
+}
+
+/// The full one-liner written into a freshly spawned ticket terminal.
+/// `None` when `shell_kind` cannot quote the prompt at all.
+fn ticket_launch_command(
+    cc_session_id: &str,
+    launch_files: &TicketLaunchFiles,
+    shell_kind: ShellKind,
+) -> Option<String> {
+    let prompt = single_line_prompt(&ticket_launch_prompt(launch_files));
+    let quoted_prompt = shell_quote(&prompt, shell_kind)?;
+    Some(format!(
+        "claude --session-id {cc_session_id} --permission-mode plan {quoted_prompt}"
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -2463,7 +2510,7 @@ impl AgentPanel {
             initial_title,
             Some(metadata.created_at),
             resume_command,
-            metadata.cc_session_id.clone(),
+            metadata.cc_session_id,
             true,
             focus,
             true,
@@ -2516,32 +2563,33 @@ impl AgentPanel {
     /// *before* spawning (so a crash mid-launch still leaves a resumable
     /// record), then spawns the terminal with the launch command as its
     /// initial input.
+    ///
+    /// The command points Claude at the brief and attachments through
+    /// worktree-relative paths, because the terminal's working directory is
+    /// the worktree and `@` mentions cannot contain spaces.
     pub fn spawn_ticket_terminal(
         &mut self,
         ticket_id: TicketId,
         launch_kind: TicketLaunchKind,
-        seeded_message: String,
+        launch_files: TicketLaunchFiles,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(store) = TicketMetadataStore::try_global(cx) else {
-            return;
-        };
-        let Some(worktree_path) = store
+    ) -> anyhow::Result<()> {
+        let store =
+            TicketMetadataStore::try_global(cx).context("ticket metadata store is unavailable")?;
+        let worktree_path = store
             .read(cx)
             .entry(&ticket_id)
             .and_then(|entry| entry.worktree_path.clone())
-        else {
-            log::error!("spawn_ticket_terminal: ticket {ticket_id:?} has no worktree yet");
-            return;
-        };
+            .with_context(|| format!("ticket {ticket_id:?} has no worktree yet"))?;
 
         let terminal_id = TerminalId::new();
         let cc_session_id = uuid::Uuid::new_v4().to_string();
-        let command = format!(
-            "claude --session-id {cc_session_id} --permission-mode plan {}",
-            shell_quote(&seeded_message)
-        );
+        let shell_kind = TerminalSettings::get_global(cx)
+            .shell
+            .shell_kind(cfg!(windows));
+        let command = ticket_launch_command(&cc_session_id, &launch_files, shell_kind)
+            .with_context(|| format!("cannot quote the ticket prompt for {shell_kind:?}"))?;
 
         let session = TicketSessionRecord {
             terminal_id,
@@ -2551,12 +2599,9 @@ impl AgentPanel {
             last_resumed_at: None,
             ended_at: None,
         };
-        if let Err(error) =
-            store.update(cx, |store, cx| store.add_session(&ticket_id, session, cx))
-        {
-            log::error!("failed to record ticket session for {ticket_id:?}: {error:#}");
-            return;
-        }
+        store
+            .update(cx, |store, cx| store.add_session(&ticket_id, session, cx))
+            .with_context(|| format!("failed to record a session for ticket {ticket_id:?}"))?;
 
         self.spawn_terminal(
             terminal_id,
@@ -2573,6 +2618,7 @@ impl AgentPanel {
             window,
             cx,
         );
+        Ok(())
     }
 
     fn edit_terminal_title(
@@ -6931,6 +6977,71 @@ mod tests {
     use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus};
     use action_log::ActionLog;
     use anyhow::{Result, anyhow};
+
+    #[test]
+    fn test_single_line_prompt() {
+        assert_eq!(
+            single_line_prompt("Ticket: Spider: Malaysia Airlines\nhttps://notion.so/abc"),
+            "Ticket: Spider: Malaysia Airlines — https://notion.so/abc"
+        );
+        assert_eq!(single_line_prompt("already one line"), "already one line");
+        assert_eq!(single_line_prompt("trailing\r\n"), "trailing");
+    }
+
+    #[test]
+    fn test_ticket_launch_command_mentions_relative_paths() {
+        let launch_files = TicketLaunchFiles {
+            brief_relative_path: ".zed-ticket/brief.md".to_string(),
+            attachment_relative_paths: vec![
+                ".zed-ticket/img-1.png".to_string(),
+                ".zed-ticket/img-2.png".to_string(),
+            ],
+        };
+
+        assert_eq!(
+            ticket_launch_command(
+                "3f1a0c58-0000-4000-8000-000000000000",
+                &launch_files,
+                ShellKind::Posix
+            )
+            .as_deref(),
+            Some(
+                "claude --session-id 3f1a0c58-0000-4000-8000-000000000000 --permission-mode plan 'Read .zed-ticket/brief.md and start working on it. @.zed-ticket/img-1.png @.zed-ticket/img-2.png'"
+            )
+        );
+
+        // A ticket with no attachments still gets exactly one `@`-free line.
+        assert_eq!(
+            ticket_launch_command(
+                "abc",
+                &TicketLaunchFiles {
+                    brief_relative_path: ".zed-ticket/brief.md".to_string(),
+                    attachment_relative_paths: Vec::new(),
+                },
+                ShellKind::PowerShell
+            )
+            .as_deref(),
+            Some(
+                "claude --session-id abc --permission-mode plan 'Read .zed-ticket/brief.md and start working on it.'"
+            )
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_matches_the_target_shell() {
+        // An apostrophe in a ticket title is what the old POSIX-only
+        // `'{}'`-with-`'\''` quoting got wrong on Windows.
+        let prompt = "Ticket: Changer l'affichage";
+
+        assert_eq!(
+            shell_quote(prompt, ShellKind::PowerShell).as_deref(),
+            Some("'Ticket: Changer l''affichage'")
+        );
+        assert_eq!(
+            shell_quote(prompt, ShellKind::Posix).as_deref(),
+            Some("\"Ticket: Changer l'affichage\"")
+        );
+    }
     use feature_flags::FeatureFlagAppExt;
     use fs::FakeFs;
     use gpui::{App, Modifiers, TestAppContext, UpdateGlobal, VisualTestContext, px, size};

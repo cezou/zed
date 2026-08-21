@@ -214,6 +214,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: left
     pub sidebar_side: Option<SidebarDockPosition>,
+    /// Whether to show Zed's own agent threads in the threads sidebar.
+    ///
+    /// Default: false
+    pub show_zed_agent_threads: Option<bool>,
     /// Default width in pixels when the agent panel is docked to the left or right.
     ///
     /// Default: 640

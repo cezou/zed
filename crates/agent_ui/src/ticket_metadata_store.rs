@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -11,12 +11,8 @@ use db::{
     },
     sqlez_macros::sql,
 };
-use git::repository::CreateWorktreeTarget;
 use gpui::{AppContext as _, AsyncApp, Entity, Global, Task, WindowHandle};
-use project::git_store::Repository;
-use project::project_settings::ProjectSettings;
 use remote::RemoteConnectionOptions;
-use settings::Settings as _;
 use ui::{App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::{AppState, MultiWorkspace, OpenOptions, OpenResult, Workspace};
@@ -655,20 +651,32 @@ async fn open_ticket_workspace(
     Ok((window, workspace))
 }
 
-/// Best-effort rollback of a worktree whose creation failed partway through;
-/// errors are logged, not propagated, since the caller is already returning
-/// its own (more relevant) error.
-async fn rollback_worktree(repo: &Entity<Repository>, path: PathBuf, cx: &mut AsyncApp) {
-    let removal = repo.update(cx, |repo, _cx| repo.remove_worktree(path.clone(), true));
-    match removal.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            log::error!("failed to roll back worktree at {}: {error:#}", path.display());
-        }
-        Err(_canceled) => {
-            log::error!("failed to roll back worktree at {}: canceled", path.display());
-        }
+/// Runs `git gtr new <branch> --porcelain` in `repo_path`, which creates the
+/// worktree and runs any `.gtrconfig` post-create hooks (secrets fetch,
+/// dependency install, editor/AI config sync, etc.) before returning —
+/// https://github.com/coderabbitai/git-worktree-runner. `--porcelain` writes
+/// exactly `path`/`branch`/`hook_status` tab-separated records to stdout on
+/// success; a failed hook exits non-zero with no success records, so `gtr`
+/// itself is the single source of truth for whether the worktree is usable —
+/// no separate rollback step is needed here.
+async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<PathBuf> {
+    let output = smol::process::Command::new("git")
+        .args(["gtr", "new", branch_name, "--porcelain"])
+        .current_dir(repo_path)
+        .output()
+        .await
+        .context("failed to run `git gtr` — is git-worktree-runner installed and on PATH?")?;
+
+    if !output.status.success() {
+        anyhow::bail!("git gtr new failed: {}", String::from_utf8_lossy(&output.stderr));
     }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(key, _)| *key == "path")
+        .map(|(_, value)| PathBuf::from(value))
+        .context("git gtr new --porcelain did not report a worktree path")
 }
 
 /// Spawns a fresh `claude` CLI session for a ticket in the given worktree,
@@ -694,10 +702,9 @@ async fn launch_ticket_session(
     Ok(())
 }
 
-/// Creates a git worktree for a ticket on a new branch cut from the
-/// configured `repo_path`'s current `HEAD` (bypassing `zed_actions::CreateWorktree`,
-/// which always creates a *detached* worktree by design), persists the
-/// result into `TicketMetadataStore`, then launches the ticket's initial
+/// Creates a git worktree for a ticket via `git gtr new` (running any
+/// `.gtrconfig` post-create hooks) in the configured `repo_path`, persists
+/// the result into `TicketMetadataStore`, then launches the ticket's initial
 /// Claude Code session in it. `ticket_id` must already have an entry in
 /// `TicketMetadataStore` (from a prior `upsert_ticket_ref` sync).
 pub async fn create_worktree_and_launch(
@@ -708,47 +715,7 @@ pub async fn create_worktree_and_launch(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
-    let (_home_window, home_workspace) =
-        open_ticket_workspace(repo_path, app_state.clone(), cx).await?;
-
-    let repo = home_workspace
-        .read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).active_repository(cx)
-        })
-        .context("no git repository open at the configured tickets_panel.repo_path")?;
-
-    let worktree_directory_setting = home_workspace.read_with(cx, |_workspace, cx| {
-        ProjectSettings::get_global(cx).git.worktree_directory.clone()
-    });
-
-    let (worktree_path, base_repo_root) = repo.update(cx, |repo, _cx| {
-        anyhow::Ok((
-            repo.path_for_new_linked_worktree(&branch_name, &worktree_directory_setting)?,
-            repo.work_directory_abs_path.to_path_buf(),
-        ))
-    })?;
-
-    let receiver = repo.update(cx, |repo, _cx| {
-        repo.create_worktree(
-            CreateWorktreeTarget::NewBranch {
-                branch_name: branch_name.clone(),
-                base_sha: None,
-            },
-            worktree_path.clone(),
-        )
-    });
-
-    match receiver.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            rollback_worktree(&repo, worktree_path, cx).await;
-            return Err(error);
-        }
-        Err(_canceled) => {
-            rollback_worktree(&repo, worktree_path, cx).await;
-            anyhow::bail!("worktree creation was canceled");
-        }
-    }
+    let worktree_path = run_gtr_new(&repo_path, &branch_name).await?;
 
     let ticket_store = cx.update(|cx| TicketMetadataStore::global(cx));
     ticket_store.update(cx, |store, cx| {
@@ -756,7 +723,7 @@ pub async fn create_worktree_and_launch(
             &ticket_id,
             worktree_path.clone(),
             branch_name,
-            base_repo_root,
+            repo_path,
             None,
             cx,
         )

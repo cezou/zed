@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod mcp_board;
 pub mod oauth;
 pub mod oauth_store;
+pub mod page_body;
 
 const NOTION_API_BASE: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2022-06-28";
@@ -26,7 +27,9 @@ const NOTION_CREDENTIALS_URL: &str = "https://api.notion.com";
 pub enum NotionError {
     #[error("Notion token is missing or invalid — set a new Personal Access Token")]
     Unauthorized,
-    #[error("Notion returned 404 for {0} — check the configured id and that it's shared with your integration")]
+    #[error(
+        "Notion returned 404 for {0} — check the configured id and that it's shared with your integration"
+    )]
     NotFound(String),
     #[error(
         "Notion says your integration can't see {0} — share it via the page's \"...\" → Connections menu"
@@ -55,9 +58,7 @@ pub mod token_store {
         let provider = zed_credentials_provider::global(cx);
         cx.spawn(async move |cx| {
             match provider.read_credentials(NOTION_CREDENTIALS_URL, cx).await {
-                Ok(Some((_username, password))) => {
-                    String::from_utf8(password).ok().map(Arc::from)
-                }
+                Ok(Some((_username, password))) => String::from_utf8(password).ok().map(Arc::from),
                 Ok(None) => None,
                 Err(error) => {
                     log::error!("failed to read Notion token from keychain: {error}");
@@ -80,7 +81,11 @@ pub mod token_store {
     /// Removes a stored Notion Personal Access Token.
     pub fn delete_token(cx: &App) -> Task<Result<()>> {
         let provider = zed_credentials_provider::global(cx);
-        cx.spawn(async move |cx| provider.delete_credentials(NOTION_CREDENTIALS_URL, cx).await)
+        cx.spawn(async move |cx| {
+            provider
+                .delete_credentials(NOTION_CREDENTIALS_URL, cx)
+                .await
+        })
     }
 }
 
@@ -101,6 +106,21 @@ pub struct TicketRef {
     pub slug: String,
     pub last_edited_time: String,
     pub ticket_type: Option<String>,
+    /// Human-facing ticket reference (Notion's `unique_id` property, e.g.
+    /// `CT-1487`). Absent when the board has no such property.
+    pub issue_id: Option<String>,
+}
+
+impl TicketRef {
+    /// The page's UUID, recovered from its URL.
+    ///
+    /// [`Self::page_id`] is **not** interchangeable with this: on the
+    /// OAuth/MCP path it is the URL's whole slug-plus-id segment. It stays
+    /// that way on purpose — it is the primary key of the on-disk ticket
+    /// store, so changing it would orphan every recorded worktree.
+    pub fn notion_page_uuid(&self) -> String {
+        extract_page_id(&self.url)
+    }
 }
 
 /// Which Notion property type the status filter needs to target — the two
@@ -265,7 +285,10 @@ impl NotionClient {
                     return Ok(id.to_string());
                 }
             }
-            let has_more = page.get("has_more").and_then(Value::as_bool).unwrap_or(false);
+            let has_more = page
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if !has_more {
                 break;
             }
@@ -286,7 +309,10 @@ impl NotionClient {
     /// Reads a database's schema to discover the real status/assignee
     /// property names and the exact (possibly emoji/number-prefixed) status
     /// option strings, rather than guessing.
-    pub async fn fetch_database_schema(&self, database_id: &str) -> Result<DatabaseSchema, NotionError> {
+    pub async fn fetch_database_schema(
+        &self,
+        database_id: &str,
+    ) -> Result<DatabaseSchema, NotionError> {
         let database = self
             .request(Method::GET, &format!("/databases/{database_id}"), None)
             .await?;
@@ -395,7 +421,10 @@ impl NotionClient {
             for page_value in results {
                 tickets.push(parse_ticket(page_value, &schema.status_property)?);
             }
-            let has_more = page.get("has_more").and_then(Value::as_bool).unwrap_or(false);
+            let has_more = page
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if !has_more {
                 break;
             }
@@ -494,11 +523,7 @@ fn parse_ticket(page: &Value, status_property: &str) -> Result<TicketRef, Notion
 
     let status_property_value = properties.get(status_property);
     let status = status_property_value
-        .and_then(|property| {
-            property
-                .get("status")
-                .or_else(|| property.get("select"))
-        })
+        .and_then(|property| property.get("status").or_else(|| property.get("select")))
         .and_then(|value| value.get("name"))
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -512,6 +537,20 @@ fn parse_ticket(page: &Value, status_property: &str) -> Result<TicketRef, Notion
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    // Notion renders a `unique_id` property as `<prefix>-<number>`; the API
+    // hands the two back separately.
+    let issue_id = properties
+        .values()
+        .filter(|property| property.get("type").and_then(Value::as_str) == Some("unique_id"))
+        .find_map(|property| {
+            let unique_id = property.get("unique_id")?;
+            let number = unique_id.get("number").and_then(Value::as_i64)?;
+            match unique_id.get("prefix").and_then(Value::as_str) {
+                Some(prefix) if !prefix.is_empty() => Some(format!("{prefix}-{number}")),
+                _ => Some(number.to_string()),
+            }
+        });
+
     Ok(TicketRef {
         page_id,
         slug: slugify(&title),
@@ -520,6 +559,7 @@ fn parse_ticket(page: &Value, status_property: &str) -> Result<TicketRef, Notion
         status,
         last_edited_time,
         ticket_type,
+        issue_id,
     })
 }
 
@@ -531,7 +571,10 @@ fn joined_plain_text(rich_text: &[Value]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-pub(crate) fn slugify(title: &str) -> String {
+/// Kebab-cases a ticket title into a starting point for a branch or
+/// directory name. Public so callers that rebuild a `TicketRef` outside this
+/// crate derive the same slug the board query would have.
+pub fn slugify(title: &str) -> String {
     let mut slug = String::with_capacity(title.len());
     let mut last_was_dash = false;
     for ch in title.chars() {
@@ -549,9 +592,70 @@ pub(crate) fn slugify(title: &str) -> String {
     slug
 }
 
+/// Notion page URLs embed the 32-hex-character page id at the very end of
+/// the last path segment's slug (with the title's own words/dashes stripped
+/// out ahead of it, e.g. `.../My-Page-Title-0123456789abcdef0123456789abcdef`) —
+/// so the id is recovered by taking the last 32 alphanumeric characters
+/// rather than trying to parse the slug structurally.
+///
+/// Needed wherever a page id is handed to a Notion API or MCP tool: on the
+/// OAuth/MCP query path [`TicketRef::page_id`] is that whole slug-plus-id
+/// segment, which `notion-fetch` rejects.
+pub fn extract_page_id(input: &str) -> String {
+    let trimmed = input.trim();
+    let without_query = trimmed.split('?').next().unwrap_or(trimmed);
+    let last_segment = without_query.rsplit('/').next().unwrap_or(without_query);
+    let cleaned: String = last_segment
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    let tail = if cleaned.len() >= 32 {
+        &cleaned[cleaned.len() - 32..]
+    } else {
+        return trimmed.to_string();
+    };
+    format!(
+        "{}-{}-{}-{}-{}",
+        &tail[0..8],
+        &tail[8..12],
+        &tail[12..16],
+        &tail[16..20],
+        &tail[20..32]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_page_id_from_a_slugged_url() {
+        assert_eq!(
+            extract_page_id(
+                "https://www.notion.so/acme/Fix-The-Thing-0123456789abcdef0123456789abcdef?pvs=4"
+            ),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+    }
+
+    #[test]
+    fn extract_page_id_from_a_bare_id() {
+        assert_eq!(
+            extract_page_id("0123456789abcdef0123456789abcdef"),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+    }
+
+    #[test]
+    fn extract_page_id_leaves_a_hyphenated_uuid_alone() {
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        assert_eq!(extract_page_id(uuid), uuid);
+    }
+
+    #[test]
+    fn extract_page_id_passes_through_anything_too_short() {
+        assert_eq!(extract_page_id("  not-an-id  "), "not-an-id");
+    }
 
     #[test]
     fn slugify_basic_title() {
@@ -668,7 +772,10 @@ mod tests {
         assert_eq!(assignee_property.as_deref(), Some("Assignee"));
         assert_eq!(
             status_options,
-            vec!["1 - Backlog".to_string(), "2 - 🏁 Ready for dev".to_string()]
+            vec![
+                "1 - Backlog".to_string(),
+                "2 - 🏁 Ready for dev".to_string()
+            ]
         );
     }
 }

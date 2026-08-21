@@ -15,8 +15,7 @@ const MCP_CREDENTIALS_URL: &str = "https://mcp.notion.com";
 pub fn load_tokens(cx: &App) -> Task<Option<OAuthTokens>> {
     let provider = zed_credentials_provider::global(cx);
     cx.spawn(async move |cx| {
-        let (_username, password) = match provider.read_credentials(MCP_CREDENTIALS_URL, cx).await
-        {
+        let (_username, password) = match provider.read_credentials(MCP_CREDENTIALS_URL, cx).await {
             Ok(Some(credentials)) => credentials,
             Ok(None) => return None,
             Err(error) => {

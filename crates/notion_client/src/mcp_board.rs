@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::mcp::{McpClient, McpError};
 use crate::TicketRef;
+use crate::mcp::{McpClient, McpError};
 
 /// Everything needed to run the filtered ticket query once discovered from a
 /// named view (e.g. "Team Board").
@@ -25,6 +25,10 @@ pub struct McpBoardConfig {
     pub status_property: String,
     pub status_values: Vec<String>,
     pub person_property: String,
+    /// Name of the board's `unique_id` property (what renders as `CT-1487`),
+    /// when it has one. Selected as an extra column so ticket rows can show a
+    /// human-facing reference.
+    pub issue_id_property: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,7 +195,10 @@ fn extract_attr<'a>(tag_open: &'a str, attr: &str) -> Option<&'a str> {
 }
 
 fn fetch_text(client_result: &Value) -> &str {
-    client_result.get("text").and_then(Value::as_str).unwrap_or_default()
+    client_result
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 /// Finds the named view (e.g. "Team Board") on the given page or database,
@@ -223,7 +230,10 @@ pub async fn discover_board(
             }
         }
     }
-    log::info!("discover_board: found {} database candidate(s): {database_candidates:?}", database_candidates.len());
+    log::info!(
+        "discover_board: found {} database candidate(s): {database_candidates:?}",
+        database_candidates.len()
+    );
     if database_candidates.is_empty() {
         return Err(McpError::Other(format!(
             "no databases found on {page_or_database_id}"
@@ -242,7 +252,9 @@ pub async fn discover_board(
             &db_text[..db_text.len().min(2000)]
         );
 
-        let Some((_, state_json)) = extract_tagged_blocks(db_text, "data-source-state").into_iter().next()
+        let Some((_, state_json)) = extract_tagged_blocks(db_text, "data-source-state")
+            .into_iter()
+            .next()
         else {
             log::info!("discover_board: candidate {candidate} has no <data-source-state> block");
             continue;
@@ -359,19 +371,28 @@ fn build_board_config(view: ViewDef, state: DataSourceState) -> Result<McpBoardC
         .map(|(name, _)| name.clone())
         .ok_or_else(|| McpError::Other("no title property found in schema".to_string()))?;
 
+    let issue_id_property = state
+        .schema
+        .iter()
+        .find(|(_, def)| def.kind == "unique_id")
+        .map(|(name, _)| name.clone());
+
     Ok(McpBoardConfig {
         data_source_url,
         title_property,
         status_property,
         status_values,
         person_property,
+        issue_id_property,
     })
 }
 
 /// Resolves the connected user's own Notion identity (for the person-column
 /// filter) via `notion-fetch id="self"`.
 pub async fn resolve_self_user_id(client: &mut McpClient) -> Result<String, McpError> {
-    let result = client.call_tool("notion-fetch", json!({ "id": "self" })).await?;
+    let result = client
+        .call_tool("notion-fetch", json!({ "id": "self" }))
+        .await?;
     let payload = result.payload()?;
     payload
         .get("self")
@@ -402,8 +423,13 @@ pub async fn query_tickets(
     let placeholders = std::iter::repeat_n("?", config.status_values.len())
         .collect::<Vec<_>>()
         .join(", ");
+    let issue_id_column = config
+        .issue_id_property
+        .as_deref()
+        .map(|property| format!(", \"{}\"", property.replace('"', "\"\"")))
+        .unwrap_or_default();
     let query = format!(
-        "SELECT url, \"{title}\", \"{status}\" FROM \"{data_source}\" WHERE \"{person}\" LIKE ? AND \"{status}\" IN ({placeholders})",
+        "SELECT url, \"{title}\", \"{status}\"{issue_id_column} FROM \"{data_source}\" WHERE \"{person}\" LIKE ? AND \"{status}\" IN ({placeholders})",
         title = config.title_property,
         status = config.status_property,
         person = config.person_property,
@@ -438,11 +464,23 @@ pub async fn query_tickets(
     Ok(envelope
         .results
         .iter()
-        .filter_map(|row| parse_row(row, &config.title_property, &config.status_property))
+        .filter_map(|row| {
+            parse_row(
+                row,
+                &config.title_property,
+                &config.status_property,
+                config.issue_id_property.as_deref(),
+            )
+        })
         .collect())
 }
 
-fn parse_row(row: &Value, title_property: &str, status_property: &str) -> Option<TicketRef> {
+fn parse_row(
+    row: &Value,
+    title_property: &str,
+    status_property: &str,
+    issue_id_property: Option<&str>,
+) -> Option<TicketRef> {
     let url = row.get("url").and_then(Value::as_str)?.to_string();
     let page_id = url.rsplit('/').next().unwrap_or(&url).to_string();
     let title = row
@@ -456,6 +494,16 @@ fn parse_row(row: &Value, title_property: &str, status_property: &str) -> Option
         .unwrap_or_default()
         .to_string();
 
+    // The query engine hands a `unique_id` back either already rendered
+    // (`"CT-1487"`) or as its bare number, depending on the column.
+    let issue_id = issue_id_property.and_then(|property| {
+        let value = row.get(property)?;
+        value
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| value.as_i64().map(|number| number.to_string()))
+    });
+
     Some(TicketRef {
         slug: crate::slugify(&title),
         page_id,
@@ -464,6 +512,7 @@ fn parse_row(row: &Value, title_property: &str, status_property: &str) -> Option
         status,
         last_edited_time: String::new(),
         ticket_type: None,
+        issue_id,
     })
 }
 
@@ -511,7 +560,8 @@ mod tests {
 
     #[test]
     fn extract_tagged_blocks_finds_url_attr_and_inner_text() {
-        let text = r#"before <data-source url="{{collection://abc}}">inner content</data-source> after"#;
+        let text =
+            r#"before <data-source url="{{collection://abc}}">inner content</data-source> after"#;
         let blocks = extract_tagged_blocks(text, "data-source");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].0, Some("{{collection://abc}}"));
@@ -535,7 +585,10 @@ mod tests {
     fn extract_tagged_blocks_handles_multiple_blocks_without_attrs() {
         let text = "<view>one</view>text<view>two</view>";
         let blocks = extract_tagged_blocks(text, "view");
-        assert_eq!(blocks.iter().map(|b| b.1).collect::<Vec<_>>(), vec!["one", "two"]);
+        assert_eq!(
+            blocks.iter().map(|b| b.1).collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
     }
 
     #[test]
@@ -552,7 +605,11 @@ mod tests {
         assert_eq!(config.title_property, "Task");
         assert_eq!(config.status_property, "Status");
         assert_eq!(config.person_property, "Owner");
-        let mut expected = vec!["1 - Todo".to_string(), "2 - Doing".to_string(), "3 - Review".to_string()];
+        let mut expected = vec![
+            "1 - Todo".to_string(),
+            "2 - Doing".to_string(),
+            "3 - Review".to_string(),
+        ];
         expected.sort();
         assert_eq!(config.status_values, expected);
     }
@@ -594,7 +651,8 @@ mod tests {
                 ]
             }}"#
         );
-        let view: ViewDef = serde_json::from_str(&view_json).expect("mixed-filter view should parse");
+        let view: ViewDef =
+            serde_json::from_str(&view_json).expect("mixed-filter view should parse");
         let config = build_board_config(view, state).expect("should build config");
         assert_eq!(config.status_values, vec!["4 - Done".to_string()]);
     }
@@ -606,9 +664,67 @@ mod tests {
             "Task": "Fake Ticket Title",
             "Status": "2 - Doing"
         });
-        let ticket = parse_row(&row, "Task", "Status").expect("row should parse");
+        let ticket = parse_row(&row, "Task", "Status", None).expect("row should parse");
         assert_eq!(ticket.title, "Fake Ticket Title");
         assert_eq!(ticket.status, "2 - Doing");
         assert_eq!(ticket.slug, "fake-ticket-title");
+        assert_eq!(ticket.issue_id, None);
+        // `page_id` stays the URL's slug-plus-id segment (it keys the ticket
+        // store); the UUID for API calls comes from `notion_page_uuid`.
+        assert_eq!(
+            ticket.page_id,
+            "Fake-Ticket-Title-00000000000000000000000000000000"
+        );
+        assert_eq!(
+            ticket.notion_page_uuid(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn query_result_row_reads_a_rendered_issue_id() {
+        let row = serde_json::json!({
+            "url": "https://www.notion.so/w/T-00000000000000000000000000000000",
+            "Task": "T",
+            "Status": "2 - Doing",
+            "ID": "CT-1487"
+        });
+        let ticket = parse_row(&row, "Task", "Status", Some("ID")).expect("row should parse");
+        assert_eq!(ticket.issue_id.as_deref(), Some("CT-1487"));
+    }
+
+    #[test]
+    fn query_result_row_reads_a_bare_numeric_issue_id() {
+        let row = serde_json::json!({
+            "url": "https://www.notion.so/w/T-00000000000000000000000000000000",
+            "Task": "T",
+            "Status": "2 - Doing",
+            "ID": 1487
+        });
+        let ticket = parse_row(&row, "Task", "Status", Some("ID")).expect("row should parse");
+        assert_eq!(ticket.issue_id.as_deref(), Some("1487"));
+    }
+
+    #[test]
+    fn build_board_config_discovers_a_unique_id_property() {
+        let state: DataSourceState = serde_json::from_str(
+            r#"{
+                "url": "collection://fake",
+                "schema": {
+                    "Task": { "type": "title" },
+                    "Owner": { "type": "person" },
+                    "ID": { "type": "unique_id" },
+                    "Status": { "type": "status", "groups": { "to_do": [{ "name": "1 - Todo" }] } }
+                }
+            }"#,
+        )
+        .expect("state should parse");
+        let view: ViewDef = serde_json::from_str(&fixture_view(
+            "Team Board",
+            r#"{"type":"is_group","value":"To-do"}"#,
+        ))
+        .expect("view should parse");
+        let config = build_board_config(view, state).expect("should build config");
+        assert_eq!(config.issue_id_property.as_deref(), Some("ID"));
     }
 }

@@ -122,9 +122,16 @@ impl McpClient {
         self.notify("notifications/initialized", None).await
     }
 
-    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<ToolResult, McpError> {
+    pub async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolResult, McpError> {
         let result = self
-            .request("tools/call", json!({ "name": name, "arguments": arguments }))
+            .request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
             .await?;
         serde_json::from_value(result)
             .map_err(|error| McpError::Other(format!("unexpected tool result shape: {error}")))
@@ -186,12 +193,17 @@ impl McpClient {
             .header("User-Agent", USER_AGENT)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
-            .header("Authorization", format!("Bearer {}", self.tokens.access_token));
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.tokens.access_token),
+            );
         if let Some(session_id) = &self.session_id {
             builder = builder.header("Mcp-Session-Id", session_id.clone());
         }
         let request = builder
-            .body(AsyncBody::from(serde_json::to_vec(body).context("failed to encode request")?))
+            .body(AsyncBody::from(
+                serde_json::to_vec(body).context("failed to encode request")?,
+            ))
             .context("failed to build request")?;
 
         let mut response = self
@@ -284,7 +296,8 @@ mod tests {
 
     #[test]
     fn parse_sse_wrapped_result() {
-        let text = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let text =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
         let result = parse_rpc_result(text).expect("should parse");
         assert_eq!(result["ok"], true);
     }
@@ -293,8 +306,14 @@ mod tests {
     fn tool_result_joins_text_content() {
         let result = ToolResult {
             content: vec![
-                ToolContent { content_type: "text".into(), text: Some("line one".into()) },
-                ToolContent { content_type: "text".into(), text: Some("line two".into()) },
+                ToolContent {
+                    content_type: "text".into(),
+                    text: Some("line one".into()),
+                },
+                ToolContent {
+                    content_type: "text".into(),
+                    text: Some("line two".into()),
+                },
             ],
             is_error: false,
             structured_content: None,

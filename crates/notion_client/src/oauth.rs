@@ -187,8 +187,8 @@ fn pkce_pair() -> (String, String) {
     let mut verifier_bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut verifier_bytes);
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
-    let challenge =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
     (verifier, challenge)
 }
 
@@ -208,7 +208,10 @@ struct CallbackResult {
 /// `server`, or the retry budget is exhausted. Mirrors the polling shape
 /// `crates/client/src/client.rs`'s `authenticate_with_browser` already uses
 /// for Zed's own sign-in flow.
-fn wait_for_callback(server: &tiny_http::Server, expected_state: &str) -> Result<String, OAuthError> {
+fn wait_for_callback(
+    server: &tiny_http::Server,
+    expected_state: &str,
+) -> Result<String, OAuthError> {
     for _ in 0..300 {
         if let Some(request) = server
             .recv_timeout(Duration::from_secs(1))
@@ -261,7 +264,10 @@ fn wait_for_callback(server: &tiny_http::Server, expected_state: &str) -> Result
 /// PKCE → open the user's browser → wait for the local callback → exchange
 /// the code for tokens. The browser step needs a live `App`, so this must run
 /// on a session with a display; there's no headless fallback.
-pub fn run_oauth_flow(http_client: Arc<dyn HttpClient>, cx: &App) -> Task<Result<OAuthTokens, OAuthError>> {
+pub fn run_oauth_flow(
+    http_client: Arc<dyn HttpClient>,
+    cx: &App,
+) -> Task<Result<OAuthTokens, OAuthError>> {
     cx.spawn(async move |cx| {
         let background = cx.background_executor().clone();
         let http_client_for_bg = http_client.clone();
@@ -289,8 +295,9 @@ pub fn run_oauth_flow(http_client: Arc<dyn HttpClient>, cx: &App) -> Task<Result
             .spawn(async move {
                 let metadata = discover_metadata(&http_client_for_bg).await?;
 
-                let server = tiny_http::Server::http("127.0.0.1:0")
-                    .map_err(|error| anyhow!(error).context("failed to bind OAuth callback port"))?;
+                let server = tiny_http::Server::http("127.0.0.1:0").map_err(|error| {
+                    anyhow!(error).context("failed to bind OAuth callback port")
+                })?;
                 let port = server
                     .server_addr()
                     .to_ip()
@@ -298,7 +305,8 @@ pub fn run_oauth_flow(http_client: Arc<dyn HttpClient>, cx: &App) -> Task<Result
                     .port();
                 let redirect_uri = format!("http://localhost:{port}/callback");
 
-                let registration = register_client(&http_client_for_bg, &metadata, &redirect_uri).await?;
+                let registration =
+                    register_client(&http_client_for_bg, &metadata, &redirect_uri).await?;
                 let (verifier, challenge) = pkce_pair();
                 let state = random_state();
 
@@ -331,7 +339,8 @@ pub fn run_oauth_flow(http_client: Arc<dyn HttpClient>, cx: &App) -> Task<Result
                 if let Some(secret) = registration.client_secret.as_deref() {
                     form.push(("client_secret", secret));
                 }
-                let token_response = post_form(&http_client_for_bg, &metadata.token_endpoint, &form).await?;
+                let token_response =
+                    post_form(&http_client_for_bg, &metadata.token_endpoint, &form).await?;
 
                 Ok(OAuthTokens {
                     client_id: registration.client_id,
@@ -370,7 +379,9 @@ pub async fn refresh_tokens(
         client_id: previous.client_id.clone(),
         client_secret: previous.client_secret.clone(),
         access_token: token_response.access_token,
-        refresh_token: token_response.refresh_token.or_else(|| previous.refresh_token.clone()),
+        refresh_token: token_response
+            .refresh_token
+            .or_else(|| previous.refresh_token.clone()),
         expires_at: now_unix() + token_response.expires_in,
     })
 }

@@ -7,6 +7,12 @@ Welcome to Zed, a high-performance, multiplayer code editor from the creators of
 
 ---
 
+### This fork
+
+Adds a Notion tickets panel: lists your assigned tickets, creates a git worktree per ticket (via `git gtr`), and opens it in Zed with a resumable `claude` CLI session already running inside. See [`FORK_NOTES.md`](./FORK_NOTES.md).
+
+---
+
 ### Installation
 
 On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).

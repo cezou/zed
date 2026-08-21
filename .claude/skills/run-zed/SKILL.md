@@ -27,11 +27,30 @@ guessing pixel positions.
      Rust source, not a bug in this driver — fix it there rather than debugging the script.
 4. **Click**: `.\.claude\skills\run-zed\driver.ps1 click -Name "Save"`
    or `.\.claude\skills\run-zed\driver.ps1 click -Role Button -Index 2`
-5. **Screenshot**: `.\.claude\skills\run-zed\driver.ps1 screenshot -Out shot.png`
-6. **Look at the screenshot** with the Read tool and confirm it actually shows the
+5. **Type**: anything reachable only through the keyboard (command palette,
+   modal text fields) needs these, since UI Automation can invoke elements but
+   not type into them:
+   - `driver.ps1 keys -Text "^+p"` — raw SendKeys syntax, for chords and named
+     keys (`^+p` = ctrl-shift-p, `{ENTER}`, `{ESC}`, `{DOWN}`).
+   - `driver.ps1 paste -Text "https://..."` — clipboard + ctrl-V. Use this for
+     literal text: SendKeys treats `+^%~(){}[]` as syntax and would mangle URLs.
+   - `driver.ps1 focus` — activate the window on its own (both of the above do
+     it implicitly).
+6. **Screenshot**: `.\.claude\skills\run-zed\driver.ps1 screenshot -Out shot.png`
+7. **Look at the screenshot** with the Read tool and confirm it actually shows the
    expected state — a non-zero exit code from `click`/`screenshot` is not itself proof
    the UI change works; the screenshot must be inspected.
-7. **Cleanup**: `.\.claude\skills\run-zed\driver.ps1 quit`
+8. **Cleanup**: `.\.claude\skills\run-zed\driver.ps1 quit`
+
+`launch` sets `ZED_STATELESS=1`, which only isolates the database. Settings
+(`%APPDATA%\Zed\settings.json`) and dev credentials
+(`%APPDATA%\Zed\development_credentials`) are the developer's real files and do
+get written by anything under test that persists configuration.
+
+`ZED_STATELESS` swaps the SQLite database for an in-memory one, so **nothing
+written to it survives the process**. To test anything that must persist across
+a restart — recorded worktrees, Claude session ids, sidebar layout — launch with
+`driver.ps1 launch -Persistent`, which writes to the developer's real database.
 
 Definition of done: a screenshot was taken **and** visually confirmed to show the
 expected state, not just "the command exited 0".

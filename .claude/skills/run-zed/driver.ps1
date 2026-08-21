@@ -31,7 +31,7 @@
 
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('build', 'launch', 'list-elements', 'click', 'screenshot', 'quit')]
+    [ValidateSet('build', 'launch', 'list-elements', 'click', 'screenshot', 'quit', 'focus', 'keys', 'paste')]
     [string]$Command,
 
     [string]$Name,
@@ -39,7 +39,9 @@ param(
     [string]$Role,
     [int]$Index = 0,
     [string]$Out,
-    [int]$TimeoutSeconds = 10
+    [string]$Text,
+    [int]$TimeoutSeconds = 10,
+    [switch]$Persistent
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +52,7 @@ $StateFile = Join-Path $PSScriptRoot '.run-zed-state.json'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 
 if (-not ([System.Management.Automation.PSTypeName]'RunZed.Native').Type) {
     Add-Type -Namespace RunZed -Name Native -MemberDefinition @'
@@ -58,6 +61,9 @@ if (-not ([System.Management.Automation.PSTypeName]'RunZed.Native').Type) {
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
 [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int nCmdShow);
 
 public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 '@
@@ -108,7 +114,16 @@ function Launch-Zed {
     # Isolated, disposable state so a test run never touches the developer's real
     # Zed config/database; ZED_ALLOW_EMULATED_GPU covers VMs/CI boxes whose GPU
     # shows up as software-emulated to Zed's Vulkan backend.
-    $env:ZED_STATELESS = '1'
+    #
+    # ZED_STATELESS swaps the SQLite database for an in-memory one
+    # (crates/db/src/db.rs, open_db), so anything under test that must survive a
+    # restart — recorded ticket worktrees, Claude session ids — is silently lost.
+    # -Persistent opts out for exactly those scenarios.
+    if ($Persistent) {
+        Remove-Item Env:\ZED_STATELESS -ErrorAction SilentlyContinue
+    } else {
+        $env:ZED_STATELESS = '1'
+    }
     $env:ZED_ALLOW_EMULATED_GPU = '1'
 
     $proc = Start-Process -FilePath $binary -PassThru
@@ -302,6 +317,80 @@ function Take-Screenshot {
     Write-Output "screenshot saved: $Out ($width x $height)"
 }
 
+# Keyboard input has to go to the foreground window, so every key/paste command
+# activates Zed first. SetForegroundWindow alone is unreliable when the caller
+# doesn't already own the foreground, hence the AppActivate fallback.
+# AppActivate first, SetForegroundWindow second: Windows refuses
+# SetForegroundWindow to a process that didn't receive the last input, which is
+# exactly the situation an agent-driven script is in. AppActivate goes through
+# the shell and isn't subject to that rule. Retried because activation can lose
+# a race with a window that is still finishing its first frame.
+function Activate-Zed {
+    $state = Load-State
+    $hwnd = Get-ZedHwnd
+    [RunZed.Native]::ShowWindow($hwnd, 9) | Out-Null  # SW_RESTORE
+
+    $shell = $null
+    try { $shell = New-Object -ComObject WScript.Shell } catch {}
+
+    for ($attempt = 0; $attempt -lt 6; $attempt++) {
+        if ([RunZed.Native]::GetForegroundWindow() -eq $hwnd) {
+            Write-Output "focused hwnd=$hwnd"
+            return
+        }
+        if ($attempt -lt 2) {
+            if ($null -ne $shell) {
+                try { $shell.AppActivate([int]$state.Pid) | Out-Null } catch {}
+            }
+            [RunZed.Native]::SetForegroundWindow($hwnd) | Out-Null
+        } else {
+            # AppActivate can report success while Windows still refuses the
+            # foreground switch (another app holds the foreground lock, e.g. the
+            # browser we just drove through an OAuth screen). Minimizing and
+            # restoring reactivates the window through the shell, which the lock
+            # does not block.
+            [RunZed.Native]::ShowWindow($hwnd, 6) | Out-Null  # SW_MINIMIZE
+            Start-Sleep -Milliseconds 400
+            [RunZed.Native]::ShowWindow($hwnd, 9) | Out-Null  # SW_RESTORE
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    if ([RunZed.Native]::GetForegroundWindow() -ne $hwnd) {
+        Write-Error "Could not bring Zed to the foreground after 5 attempts; keystrokes would land in another window."
+        exit $ExitClickFailed
+    }
+    Write-Output "focused hwnd=$hwnd"
+}
+
+# Raw SendKeys syntax, for chords and named keys: "^+p" (ctrl+shift+p),
+# "{ENTER}", "{ESC}", "{DOWN}". Literal text should go through 'paste' instead,
+# since SendKeys treats +^%~(){}[] as syntax.
+function Send-Keys {
+    if (-not $Text) {
+        Write-Error "-Text <sendkeys-sequence> is required for keys."
+        exit $ExitElementNotFound
+    }
+    Activate-Zed | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait($Text)
+    Start-Sleep -Milliseconds 300
+    Write-Output "sent keys: $Text"
+}
+
+# Clipboard + ctrl+V rather than per-character SendKeys: no escaping pitfalls and
+# it can't drop characters in a URL.
+function Paste-Text {
+    if (-not $Text) {
+        Write-Error "-Text <string> is required for paste."
+        exit $ExitElementNotFound
+    }
+    Set-Clipboard -Value $Text
+    Activate-Zed | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait('^v')
+    Start-Sleep -Milliseconds 300
+    Write-Output "pasted: $Text"
+}
+
 function Quit-Zed {
     $state = Load-State
     Stop-Process -Id $state.Pid -Force -ErrorAction SilentlyContinue
@@ -315,6 +404,9 @@ switch ($Command) {
     'list-elements'  { List-Elements }
     'click'          { Click-Element }
     'screenshot'     { Take-Screenshot }
+    'focus'          { Activate-Zed }
+    'keys'           { Send-Keys }
+    'paste'          { Paste-Text }
     'quit'           { Quit-Zed }
 }
 

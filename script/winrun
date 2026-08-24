@@ -138,9 +138,16 @@ PS
 fi
 
 if [[ $detach -eq 1 ]]; then
-    # The command is written to a .cmd file and started through Start-Process:
-    # that detaches it from this SSH session, so it outlives a dropped
-    # connection, and it keeps the redirection out of PowerShell's quoting.
+    # The command goes into a .cmd file, which keeps the redirection out of
+    # PowerShell's quoting, and that file is started through WMI rather than
+    # Start-Process. Windows OpenSSH puts each session in a job object and kills
+    # every descendant when the connection closes, so a Start-Process child dies
+    # with the SSH session — measured, not assumed. A process created by the WMI
+    # service is not a descendant of the session, so it survives.
+    #
+    # The price is that it starts in session 0 with the *machine* environment,
+    # losing the user PATH that rustup installs into — hence baking this
+    # session's PATH into the script rather than relying on inheritance.
     remote <<PS
 New-Item -ItemType Directory -Force -Path '${ZED_WIN_REPO}\target' | Out-Null
 Remove-Item -Force -ErrorAction SilentlyContinue '${DONE}'
@@ -148,13 +155,20 @@ Remove-Item -Force -ErrorAction SilentlyContinue '${PIDFILE}'
 Set-Content -Path '${LOG}' -Value '' -Encoding ascii
 \$runner = '${ZED_WIN_REPO}\target\winrun.cmd'
 Set-Content -Path \$runner -Encoding ascii -Value @(
+    '@echo off',
+    ('set "PATH=' + \$env:PATH + '"'),
     'cd /d "${ZED_WIN_REPO}"',
     '${command} > "${LOG}" 2>&1',
     'echo %errorlevel% > "${DONE}"'
 )
-\$started = Start-Process -FilePath cmd.exe -ArgumentList '/c', \$runner -WindowStyle Hidden -PassThru
-Set-Content -Path '${PIDFILE}' -Value \$started.Id
-Write-Output ("started, pid " + \$started.Id)
+\$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ``
+    -Arguments @{ CommandLine = 'cmd.exe /c "' + \$runner + '"' }
+if (\$created.ReturnValue -ne 0) {
+    Write-Error ("Win32_Process.Create failed with " + \$created.ReturnValue)
+    exit 1
+}
+Set-Content -Path '${PIDFILE}' -Value \$created.ProcessId
+Write-Output ("started, pid " + \$created.ProcessId)
 PS
     echo "winrun: started detached on $ZED_WIN_HOST — follow with 'script/winrun --tail'" >&2
     exit 0

@@ -46,11 +46,17 @@ round-trip — no tag, no publish, no manual download.
 git commit -am "..."                                       # winrun refuses a dirty tree
 script/winrun --wsl --detach -- cargo build -p zed         # dev profile, incremental
 script/winrun --wsl --status                               # or --wsl --tail
-script/winrun --wsl -- strip --strip-debug \
-    "$ZED_WSL_TARGET/debug/zed" -o /tmp/zed-dev            # shrink before the transfer
-script/winrun --wsl --pull /tmp/zed-dev ./zed-dev && chmod +x ./zed-dev
+script/winrun --wsl -- 'strip --strip-debug \
+    $ZED_WSL_TARGET/debug/zed -o $HOME/zed-dev'            # shrink before the transfer
+script/winrun --wsl --pull '$HOME/zed-dev' ./zed-dev && chmod +x ./zed-dev
 ./zed-dev
 ```
+
+Stage artifacts under `$HOME` in WSL, not `/tmp`: the distribution is shut down and restarted
+between winrun invocations, and `/tmp` does not survive it.
+
+Measured on this setup: an incremental `cargo build -p zed` takes about 2 minutes, the stripped dev
+binary is 1.1 GB, and pulling it takes 38 seconds — md5 identical either side.
 
 Build with the **dev** profile for iteration. `[profile.release]` carries `lto = "thin"` and
 `codegen-units = 1`, which is minutes per iteration for no benefit while testing behaviour; keep it

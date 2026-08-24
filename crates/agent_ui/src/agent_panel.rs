@@ -45,6 +45,7 @@ use crate::terminal_thread_metadata_store::{
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::ticket_metadata_store::{
     TicketId, TicketLaunchFiles, TicketLaunchKind, TicketMetadataStore, TicketSessionRecord,
+    TicketTerminalLaunch,
 };
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
@@ -236,6 +237,54 @@ fn ticket_launch_command(
     Some(format!(
         "claude --session-id {cc_session_id} --permission-mode plan {quoted_prompt}"
     ))
+}
+
+/// Bare `claude --resume`, which makes Claude show its own session picker.
+/// Used when adopting a session Zed never launched, so there is no id to name.
+/// Doubling as the marker that such a terminal is resumable at all (see
+/// [`terminal_resume_command`]) is why it is a constant rather than a literal.
+const CLAUDE_RESUME_COMMAND: &str = "claude --resume";
+
+/// What a ticket terminal is spawned with: the command typed into it, the
+/// `claude` session id to record (none when Claude's picker owns that choice),
+/// and how the session should be recorded.
+fn ticket_terminal_spawn(
+    launch: TicketTerminalLaunch,
+    shell_kind: ShellKind,
+) -> anyhow::Result<(String, Option<String>, TicketLaunchKind)> {
+    match launch {
+        TicketTerminalLaunch::Brief {
+            launch_files,
+            launch_kind,
+        } => {
+            let cc_session_id = uuid::Uuid::new_v4().to_string();
+            let command = ticket_launch_command(&cc_session_id, &launch_files, shell_kind)
+                .with_context(|| format!("cannot quote the ticket prompt for {shell_kind:?}"))?;
+            Ok((command, Some(cc_session_id), launch_kind))
+        }
+        TicketTerminalLaunch::ResumePicker => Ok((
+            CLAUDE_RESUME_COMMAND.to_string(),
+            None,
+            TicketLaunchKind::Resumed,
+        )),
+    }
+}
+
+/// The command a restored terminal is respawned with.
+///
+/// A terminal launched with a Zed-minted session id resumes that exact
+/// session. One that was started through Claude's own picker has no id to
+/// resume — Claude alone knows which session was chosen — so it reopens the
+/// picker instead of dropping the user into a bare shell.
+fn terminal_resume_command(metadata: &TerminalThreadMetadata) -> Option<String> {
+    if let Some(cc_session_id) = metadata.cc_session_id.as_ref() {
+        return Some(format!("{CLAUDE_RESUME_COMMAND} {cc_session_id}"));
+    }
+    metadata
+        .initial_command
+        .as_deref()
+        .filter(|command| *command == CLAUDE_RESUME_COMMAND)
+        .map(str::to_string)
 }
 
 #[derive(Clone, Debug)]
@@ -2496,13 +2545,10 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(metadata.terminal_id);
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
-        // Only a terminal that was previously launched with a captured `claude`
-        // session id gets a resume command on respawn; a plain agent-panel
-        // terminal restore continues to open a blank shell exactly as before.
-        let resume_command = metadata
-            .cc_session_id
-            .as_ref()
-            .map(|id| format!("claude --resume {id}"));
+        // Only a terminal that was previously launched as a `claude` session
+        // gets a resume command on respawn; a plain agent-panel terminal
+        // restore continues to open a blank shell exactly as before.
+        let resume_command = terminal_resume_command(&metadata);
         self.spawn_terminal(
             metadata.terminal_id,
             working_directory,
@@ -2559,19 +2605,20 @@ impl AgentPanel {
     }
 
     /// Launches a `claude` CLI session for a ticket: mints a fresh terminal
-    /// id and session id, records the session in `TicketMetadataStore`
-    /// *before* spawning (so a crash mid-launch still leaves a resumable
-    /// record), then spawns the terminal with the launch command as its
-    /// initial input.
+    /// id, records the session in `TicketMetadataStore` *before* spawning (so
+    /// a crash mid-launch still leaves a resumable record), then spawns the
+    /// terminal with the launch command as its initial input.
     ///
-    /// The command points Claude at the brief and attachments through
-    /// worktree-relative paths, because the terminal's working directory is
-    /// the worktree and `@` mentions cannot contain spaces.
+    /// A brief-driven launch also mints the session id, and points Claude at
+    /// the brief and attachments through worktree-relative paths, because the
+    /// terminal's working directory is the worktree and `@` mentions cannot
+    /// contain spaces. A resume has no id of its own: Claude's picker chooses
+    /// the session and only Claude knows which one, so the record keeps
+    /// `cc_session_id: None`.
     pub fn spawn_ticket_terminal(
         &mut self,
         ticket_id: TicketId,
-        launch_kind: TicketLaunchKind,
-        launch_files: TicketLaunchFiles,
+        launch: TicketTerminalLaunch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
@@ -2584,16 +2631,14 @@ impl AgentPanel {
             .with_context(|| format!("ticket {ticket_id:?} has no worktree yet"))?;
 
         let terminal_id = TerminalId::new();
-        let cc_session_id = uuid::Uuid::new_v4().to_string();
         let shell_kind = TerminalSettings::get_global(cx)
             .shell
             .shell_kind(cfg!(windows));
-        let command = ticket_launch_command(&cc_session_id, &launch_files, shell_kind)
-            .with_context(|| format!("cannot quote the ticket prompt for {shell_kind:?}"))?;
+        let (command, cc_session_id, launch_kind) = ticket_terminal_spawn(launch, shell_kind)?;
 
         let session = TicketSessionRecord {
             terminal_id,
-            cc_session_id: Some(cc_session_id.clone()),
+            cc_session_id: cc_session_id.clone(),
             launch_kind,
             created_at: Utc::now(),
             last_resumed_at: None,
@@ -2610,7 +2655,7 @@ impl AgentPanel {
             None,
             None,
             Some(command),
-            Some(cc_session_id),
+            cc_session_id,
             true,
             true,
             true,
@@ -7024,6 +7069,72 @@ mod tests {
             Some(
                 "claude --session-id abc --permission-mode plan 'Read .zed-ticket/brief.md and start working on it.'"
             )
+        );
+    }
+
+    #[test]
+    fn test_ticket_terminal_spawn() {
+        let (command, cc_session_id, launch_kind) = ticket_terminal_spawn(
+            TicketTerminalLaunch::Brief {
+                launch_files: TicketLaunchFiles {
+                    brief_relative_path: ".zed-ticket/brief.md".to_string(),
+                    attachment_relative_paths: Vec::new(),
+                },
+                launch_kind: TicketLaunchKind::Additional,
+            },
+            ShellKind::Posix,
+        )
+        .unwrap();
+        let cc_session_id = cc_session_id.expect("a brief-driven launch mints its own session id");
+        assert!(command.contains(&format!("claude --session-id {cc_session_id} ")));
+        assert_eq!(launch_kind, TicketLaunchKind::Additional);
+
+        // Claude's picker owns the choice of session, so there is no id to
+        // record and the session is marked as resumed rather than launched.
+        assert_eq!(
+            ticket_terminal_spawn(TicketTerminalLaunch::ResumePicker, ShellKind::Posix).unwrap(),
+            (
+                "claude --resume".to_string(),
+                None,
+                TicketLaunchKind::Resumed
+            )
+        );
+    }
+
+    #[test]
+    fn test_terminal_resume_command() {
+        let metadata =
+            |initial_command: Option<&str>, cc_session_id: Option<&str>| TerminalThreadMetadata {
+                terminal_id: TerminalId::new(),
+                title: "claude".into(),
+                custom_title: None,
+                created_at: Utc::now(),
+                worktree_paths: WorktreePaths::default(),
+                remote_connection: None,
+                working_directory: None,
+                initial_command: initial_command.map(str::to_string),
+                cc_session_id: cc_session_id.map(str::to_string),
+            };
+
+        assert_eq!(
+            terminal_resume_command(&metadata(
+                Some("claude --session-id abc --permission-mode plan 'go'"),
+                Some("abc")
+            ))
+            .as_deref(),
+            Some("claude --resume abc")
+        );
+        // Started through Claude's own picker: no id to name, so the picker
+        // comes back rather than a bare shell.
+        assert_eq!(
+            terminal_resume_command(&metadata(Some("claude --resume"), None)).as_deref(),
+            Some("claude --resume")
+        );
+        // A plain agent-panel terminal keeps opening a blank shell.
+        assert_eq!(terminal_resume_command(&metadata(None, None)), None);
+        assert_eq!(
+            terminal_resume_command(&metadata(Some("cargo run"), None)),
+            None
         );
     }
 

@@ -8429,7 +8429,9 @@ impl Sidebar {
             (
                 "create-ticket-worktree",
                 IconName::GitBranch,
-                "Create Worktree",
+                // The modal can cut a worktree or attach one that already
+                // exists, so this no longer promises a `git gtr new`.
+                "Start a Session",
             )
         };
 

@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_ui::ticket_metadata_store::{
-    self, TicketId, TicketLaunchSpec, TicketMetadataStore, ticket_images_dir,
+    self, GtrWorktree, TicketId, TicketLaunchSpec, TicketMetadataStore, TicketSessionStart,
+    ticket_images_dir,
 };
 use anyhow::Context as _;
 use chrono::Utc;
@@ -49,13 +50,39 @@ const BODY_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
-    /// The ticket has no worktree yet: cut one, then launch in it.
+    /// The ticket has no worktree yet: cut one or attach an existing one, then
+    /// launch in it.
     CreateWorktree,
     /// The ticket already has a worktree: launch one more session in it.
     AdditionalSession,
 }
 
+/// Which worktree the ticket's session should run in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeChoice {
+    /// Cut a new branch and worktree with `git gtr new`.
+    New,
+    /// Attach the ticket to `worktrees[index]`, which already exists.
+    Existing(usize),
+}
+
+/// Which `claude` session the launch should start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionChoice {
+    /// Write the brief into the worktree and start a fresh session on it.
+    New,
+    /// Run bare `claude --resume` and let Claude's own picker choose which
+    /// existing session to continue. No brief, no prompt.
+    Resume,
+}
+
 enum BodyState {
+    Loading,
+    Ready,
+    Failed(SharedString),
+}
+
+enum WorktreesState {
     Loading,
     Ready,
     Failed(SharedString),
@@ -66,8 +93,13 @@ pub struct TicketLaunchModal {
     ticket_id: TicketId,
     mode: LaunchMode,
     fs: Arc<dyn Fs>,
+    focus_handle: FocusHandle,
     repositories: Vec<TicketRepository>,
     selected_repository: Option<usize>,
+    worktrees: Vec<GtrWorktree>,
+    worktrees_state: WorktreesState,
+    worktree_choice: WorktreeChoice,
+    session_choice: SessionChoice,
     branch_editor: Entity<Editor>,
     brief_editor: Entity<Editor>,
     body_state: BodyState,
@@ -77,6 +109,7 @@ pub struct TicketLaunchModal {
     launching: bool,
     _body_task: Task<()>,
     _attachment_task: Task<()>,
+    _worktrees_task: Task<()>,
 }
 
 impl EventEmitter<DismissEvent> for TicketLaunchModal {}
@@ -86,10 +119,22 @@ impl Focusable for TicketLaunchModal {
     /// Focus lands on an editor rather than the modal container so the
     /// `TicketLaunch > Editor` keymap contexts apply; the container is still
     /// the ancestor every action bubbles through.
+    ///
+    /// Resuming is the exception: it renders neither editor, and focusing a
+    /// handle whose element is not in the tree would leave the modal unable to
+    /// dispatch its own actions, so focus goes to the container — whose
+    /// `TicketLaunch` context carries the same bindings.
     fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.resuming() {
+            return self.focus_handle.clone();
+        }
         match self.mode {
-            LaunchMode::CreateWorktree => self.branch_editor.focus_handle(cx),
-            LaunchMode::AdditionalSession => self.brief_editor.focus_handle(cx),
+            LaunchMode::CreateWorktree if self.worktree_choice == WorktreeChoice::New => {
+                self.branch_editor.focus_handle(cx)
+            }
+            LaunchMode::CreateWorktree | LaunchMode::AdditionalSession => {
+                self.brief_editor.focus_handle(cx)
+            }
         }
     }
 }
@@ -145,8 +190,13 @@ impl TicketLaunchModal {
             ticket_id,
             mode,
             fs,
+            focus_handle: cx.focus_handle(),
             repositories,
             selected_repository,
+            worktrees: Vec::new(),
+            worktrees_state: WorktreesState::Ready,
+            worktree_choice: WorktreeChoice::New,
+            session_choice: SessionChoice::New,
             branch_editor,
             brief_editor,
             body_state: BodyState::Loading,
@@ -156,10 +206,90 @@ impl TicketLaunchModal {
             launching: false,
             _body_task: Task::ready(()),
             _attachment_task: Task::ready(()),
+            _worktrees_task: Task::ready(()),
         };
         this.load_body(false, window, cx);
         this.load_attachment_index(cx);
+        if mode == LaunchMode::CreateWorktree {
+            this.load_worktrees(cx);
+        }
         this
+    }
+
+    /// Lists the selected repository's worktrees so the ticket can be attached
+    /// to one instead of cutting a new one.
+    ///
+    /// Every reload resets the choice back to `New`: a `WorktreeChoice::Existing`
+    /// index only means something for the listing it was picked from.
+    fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.worktrees = Vec::new();
+        self.worktree_choice = WorktreeChoice::New;
+        self.session_choice = SessionChoice::New;
+
+        let Some(repository) = self.selected_repository().cloned() else {
+            self.worktrees_state = WorktreesState::Ready;
+            cx.notify();
+            return;
+        };
+
+        self.worktrees_state = WorktreesState::Loading;
+        cx.notify();
+
+        self._worktrees_task = cx.spawn(async move |this, cx| {
+            let listed = ticket_metadata_store::existing_worktrees(&repository.path).await;
+            this.update(cx, |this, cx| {
+                match listed {
+                    Ok(worktrees) => {
+                        this.worktrees = worktrees;
+                        this.worktrees_state = WorktreesState::Ready;
+                    }
+                    Err(error) => {
+                        this.worktrees_state = WorktreesState::Failed(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
+    fn selected_worktree(&self) -> Option<&GtrWorktree> {
+        match self.worktree_choice {
+            WorktreeChoice::New => None,
+            WorktreeChoice::Existing(index) => self.worktrees.get(index),
+        }
+    }
+
+    /// Resuming only makes sense on a worktree that already exists: one about
+    /// to be cut has no Claude history to pick from.
+    fn can_resume(&self) -> bool {
+        match self.mode {
+            LaunchMode::CreateWorktree => self.selected_worktree().is_some(),
+            LaunchMode::AdditionalSession => true,
+        }
+    }
+
+    fn resuming(&self) -> bool {
+        self.can_resume() && self.session_choice == SessionChoice::Resume
+    }
+
+    fn launch_spec(&self, cx: &App) -> TicketLaunchSpec {
+        TicketLaunchSpec {
+            brief_markdown: self.brief_editor.read(cx).text(cx),
+            attachments: self
+                .attachments
+                .iter()
+                .map(|attachment| attachment.path.clone())
+                .collect(),
+        }
+    }
+
+    fn session_start(&self, cx: &App) -> TicketSessionStart {
+        if self.resuming() {
+            TicketSessionStart::ResumePicker
+        } else {
+            TicketSessionStart::Brief(self.launch_spec(cx))
+        }
     }
 
     /// Seeds `next_image_index` from what is already on disk, so reopening the
@@ -263,6 +393,7 @@ impl TicketLaunchModal {
                             .iter()
                             .position(|candidate| candidate.path == repository.path);
                         this.error = None;
+                        this.load_worktrees(cx);
                     }
                     // The user dismissed the directory picker.
                     Ok(None) => {}
@@ -334,14 +465,6 @@ impl TicketLaunchModal {
         if self.launching {
             return;
         }
-        let spec = TicketLaunchSpec {
-            brief_markdown: self.brief_editor.read(cx).text(cx),
-            attachments: self
-                .attachments
-                .iter()
-                .map(|attachment| attachment.path.clone())
-                .collect(),
-        };
         let fs = self.fs.clone();
         let ticket_id = self.ticket_id.clone();
 
@@ -353,35 +476,67 @@ impl TicketLaunchModal {
 
         let task = match self.mode {
             LaunchMode::CreateWorktree => {
-                let branch_name = self.branch_editor.read(cx).text(cx).trim().to_string();
-                if branch_name.is_empty() {
-                    self.error = Some("Give the worktree a branch name first".into());
-                    cx.notify();
-                    return;
-                }
                 let Some(repository) = self.selected_repository().cloned() else {
                     self.error = Some("Add a repository to cut this ticket's worktree from".into());
                     cx.notify();
                     return;
                 };
-                repository_registry::mark_used(&repository.path, cx).detach_and_log_err(cx);
+                match self.worktree_choice {
+                    WorktreeChoice::New => {
+                        let branch_name = self.branch_editor.read(cx).text(cx).trim().to_string();
+                        if branch_name.is_empty() {
+                            self.error = Some("Give the worktree a branch name first".into());
+                            cx.notify();
+                            return;
+                        }
+                        let spec = self.launch_spec(cx);
+                        repository_registry::mark_used(&repository.path, cx).detach_and_log_err(cx);
+                        cx.spawn(async move |_this, cx| {
+                            ticket_metadata_store::create_worktree_and_launch(
+                                ticket_id,
+                                repository.path,
+                                branch_name,
+                                spec,
+                                fs,
+                                app_state,
+                                cx,
+                            )
+                            .await
+                        })
+                    }
+                    WorktreeChoice::Existing(index) => {
+                        let Some(worktree) = self.worktrees.get(index).cloned() else {
+                            self.error = Some("Pick the worktree to attach this ticket to".into());
+                            cx.notify();
+                            return;
+                        };
+                        let start = self.session_start(cx);
+                        repository_registry::mark_used(&repository.path, cx).detach_and_log_err(cx);
+                        cx.spawn(async move |_this, cx| {
+                            ticket_metadata_store::attach_worktree_and_launch(
+                                ticket_id,
+                                repository.path,
+                                worktree.path,
+                                worktree.branch,
+                                start,
+                                fs,
+                                app_state,
+                                cx,
+                            )
+                            .await
+                        })
+                    }
+                }
+            }
+            LaunchMode::AdditionalSession => {
+                let start = self.session_start(cx);
                 cx.spawn(async move |_this, cx| {
-                    ticket_metadata_store::create_worktree_and_launch(
-                        ticket_id,
-                        repository.path,
-                        branch_name,
-                        spec,
-                        fs,
-                        app_state,
-                        cx,
+                    ticket_metadata_store::launch_additional_session(
+                        ticket_id, start, fs, app_state, cx,
                     )
                     .await
                 })
             }
-            LaunchMode::AdditionalSession => cx.spawn(async move |_this, cx| {
-                ticket_metadata_store::launch_additional_session(ticket_id, spec, fs, app_state, cx)
-                    .await
-            }),
         };
 
         self.launching = true;
@@ -490,7 +645,7 @@ impl TicketLaunchModal {
                     menu = menu.entry(repository.name.clone(), None, move |_window, cx| {
                         this.update(cx, |this, cx| {
                             this.selected_repository = Some(index);
-                            cx.notify();
+                            this.load_worktrees(cx);
                         })
                         .ok();
                     });
@@ -503,6 +658,120 @@ impl TicketLaunchModal {
         )
         .style(DropdownStyle::Outlined)
         .full_width(true)
+    }
+
+    fn render_worktree_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = self
+            .selected_worktree()
+            .map(|worktree| SharedString::from(worktree.branch.clone()))
+            .unwrap_or_else(|| SharedString::from("New worktree"));
+        let worktrees = self.worktrees.clone();
+        let this = cx.entity().downgrade();
+
+        DropdownMenu::new(
+            "ticket-launch-worktree",
+            label,
+            ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                {
+                    let this = this.clone();
+                    menu = menu.entry("New worktree", None, move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.worktree_choice = WorktreeChoice::New;
+                            this.refocus(window, cx);
+                        })
+                        .ok();
+                    });
+                }
+                if !worktrees.is_empty() {
+                    menu = menu.separator();
+                }
+                for (index, worktree) in worktrees.iter().enumerate() {
+                    let this = this.clone();
+                    menu = menu.entry(worktree.branch.clone(), None, move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.worktree_choice = WorktreeChoice::Existing(index);
+                            this.refocus(window, cx);
+                        })
+                        .ok();
+                    });
+                }
+                menu
+            }),
+        )
+        .style(DropdownStyle::Outlined)
+        .full_width(true)
+    }
+
+    /// The path of the attached worktree, or why the listing is unavailable —
+    /// the dropdown only ever shows branch names.
+    fn render_worktree_status(&self, _cx: &Context<Self>) -> Option<AnyElement> {
+        match &self.worktrees_state {
+            WorktreesState::Loading => Some(
+                Label::new("Listing the repository's worktrees…")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ),
+            WorktreesState::Failed(message) => Some(
+                Label::new(format!("Couldn't list worktrees: {message}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Warning)
+                    .into_any_element(),
+            ),
+            WorktreesState::Ready => self.selected_worktree().map(|worktree| {
+                Label::new(worktree.path.to_string_lossy().to_string())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element()
+            }),
+        }
+    }
+
+    fn render_session_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = match self.session_choice {
+            SessionChoice::New => "Start a new session",
+            SessionChoice::Resume => "Resume an existing session",
+        };
+        let this = cx.entity().downgrade();
+
+        DropdownMenu::new(
+            "ticket-launch-session",
+            SharedString::from(label),
+            ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                let choices = [
+                    ("Start a new session", SessionChoice::New),
+                    ("Resume an existing session", SessionChoice::Resume),
+                ];
+                choices.into_iter().fold(menu, |menu, (label, choice)| {
+                    let this = this.clone();
+                    menu.entry(label, None, move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.session_choice = choice;
+                            this.refocus(window, cx);
+                        })
+                        .ok();
+                    })
+                })
+            }),
+        )
+        .style(DropdownStyle::Outlined)
+        .full_width(true)
+    }
+
+    /// Moves focus to whatever the new choice renders, since switching to or
+    /// away from a resume unmounts the editor that had it.
+    fn refocus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
     }
 
     fn render_brief(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -602,10 +871,10 @@ impl TicketLaunchModal {
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let launch_label = if self.launching {
-            "Launching…"
-        } else {
-            "Launch"
+        let launch_label = match (self.launching, self.resuming()) {
+            (true, _) => "Launching…",
+            (false, true) => "Resume",
+            (false, false) => "Launch",
         };
         h_flex()
             .w_full()
@@ -634,9 +903,12 @@ impl TicketLaunchModal {
 impl Render for TicketLaunchModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let creating_worktree = self.mode == LaunchMode::CreateWorktree;
+        let cutting_a_branch = creating_worktree && self.worktree_choice == WorktreeChoice::New;
+        let resuming = self.resuming();
         v_flex()
             .id("ticket-launch-modal")
             .key_context("TicketLaunch")
+            .track_focus(&self.focus_handle)
             .capture_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::launch))
@@ -646,7 +918,12 @@ impl Render for TicketLaunchModal {
             .gap_3()
             .child(self.render_header(cx))
             .when(creating_worktree, |this| {
-                this.child(self.render_repository_picker(window, cx)).child(
+                this.child(self.render_repository_picker(window, cx))
+                    .child(self.render_worktree_picker(window, cx))
+                    .children(self.render_worktree_status(cx))
+            })
+            .when(cutting_a_branch, |this| {
+                this.child(
                     div()
                         .w_full()
                         .px_2()
@@ -657,15 +934,31 @@ impl Render for TicketLaunchModal {
                         .child(self.branch_editor.clone()),
                 )
             })
-            .child(self.render_brief(cx))
-            .children(self.render_attachments(cx))
-            .children(self.unmentionable_attachments().into_iter().map(|name| {
-                Label::new(format!(
-                    "{name} has a space in its name; Claude will be told to open it as a file."
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Warning)
-            }))
+            .when(self.can_resume(), |this| {
+                this.child(self.render_session_picker(window, cx))
+            })
+            .when(resuming, |this| {
+                this.child(
+                    Label::new(
+                        "Claude will show its own session picker in the worktree — no brief is \
+                         sent.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+            })
+            .when(!resuming, |this| {
+                this.child(self.render_brief(cx))
+                    .children(self.render_attachments(cx))
+                    .children(self.unmentionable_attachments().into_iter().map(|name| {
+                        Label::new(format!(
+                            "{name} has a space in its name; Claude will be told to open it as a \
+                             file."
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning)
+                    }))
+            })
             .child(self.render_footer(cx))
     }
 }

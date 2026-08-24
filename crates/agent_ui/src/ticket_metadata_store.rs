@@ -875,12 +875,15 @@ async fn open_ticket_workspace(
     Ok((window, workspace))
 }
 
-/// Runs `git gtr new <branch> --porcelain` in `repo_path`, which creates the
+/// Runs `git gtr new <branch> --yes` in `repo_path`, which creates the
 /// worktree and runs any `.gtrconfig` post-create hooks (secrets fetch,
 /// dependency install, editor/AI config sync, etc.) before returning —
 /// https://github.com/coderabbitai/git-worktree-runner. A failed hook exits
 /// non-zero, so `gtr` itself is the single source of truth for whether the
 /// worktree is usable — no separate rollback step is needed here.
+///
+/// `--yes` is `new`'s non-interactive mode: spawned from the UI there is no
+/// terminal to answer a prompt on, so gtr must fail rather than block.
 ///
 /// The resulting path is then looked up through `git gtr list` rather than read
 /// out of `new`'s own `path` record: `new` derives that record from the shell's
@@ -889,7 +892,7 @@ async fn open_ticket_workspace(
 /// `git worktree list` does.
 async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<PathBuf> {
     let output = smol::process::Command::new("git")
-        .args(["gtr", "new", branch_name, "--porcelain"])
+        .args(["gtr", "new", branch_name, "--yes"])
         .current_dir(repo_path)
         .output()
         .await

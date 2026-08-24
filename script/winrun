@@ -161,8 +161,7 @@ Set-Content -Path \$runner -Encoding ascii -Value @(
     '${command} > "${LOG}" 2>&1',
     'echo %errorlevel% > "${DONE}"'
 )
-\$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create ``
-    -Arguments @{ CommandLine = 'cmd.exe /c "' + \$runner + '"' }
+\$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'cmd.exe /c "' + \$runner + '"' }
 if (\$created.ReturnValue -ne 0) {
     Write-Error ("Win32_Process.Create failed with " + \$created.ReturnValue)
     exit 1

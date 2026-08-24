@@ -49,5 +49,17 @@ Use `--detach` for anything past roughly ten minutes: it runs the command throug
 - **PATH in a non-interactive session.** If `cargo` is "not recognized" remotely while it works in
   the developer's own terminal, rustup is only on the interactive profile's PATH — fix the machine
   PATH on Windows rather than working around it in the script.
+- **`cargo.exe` found but refusing to run** ("no application is associated with the specified file",
+  or from cmd "the system cannot execute the specified program") is a different problem: rustup's
+  shims in `%USERPROFILE%\.cargo\bin` are then 0-byte symlinks to `rustup.exe`, which do not resolve
+  in an SSH session. Replace them with copies — rustup dispatches on the executable's name, so a
+  copy named `cargo.exe` *is* cargo. A later `rustup self update` can bring the symlinks back.
+
+  ```powershell
+  $bin = "$env:USERPROFILE\.cargo\bin"
+  Get-ChildItem $bin -Filter *.exe | Where-Object { $_.Length -eq 0 } | ForEach-Object {
+      $t = $_.FullName; Remove-Item $t -Force; Copy-Item "$bin\rustup.exe" $t
+  }
+  ```
 - The command is embedded into a PowerShell here-string, so a command containing single quotes needs
   care. Cargo invocations don't; complex one-liners might.

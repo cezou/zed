@@ -46,6 +46,7 @@ source "$CONFIG_FILE"
 # expand through three levels of quoting), and untouched by `git checkout`.
 LOG="${ZED_WIN_REPO}\\target\\winrun.log"
 DONE="${ZED_WIN_REPO}\\target\\winrun.done"
+PIDFILE="${ZED_WIN_REPO}\\target\\winrun.pid"
 
 detach=0
 sync=1
@@ -63,12 +64,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Feeds a PowerShell script over stdin rather than as a command-line argument:
-# the remote default shell re-parses anything passed as an argument, and the
-# resulting bash/ssh/pwsh quoting is unmaintainable. `-NoProfile` also keeps the
-# developer's interactive profile from changing how builds behave.
+# Reads a PowerShell script on stdin and runs it on the Windows machine.
+#
+# It goes over as -EncodedCommand rather than as a plain argument or on the
+# remote process's stdin. An argument would be re-parsed by the remote default
+# shell, making the bash/ssh/PowerShell quoting unmaintainable; and `-Command -`
+# only executes stdin one line at a time, so a multi-line `if`/`else` block is
+# silently dropped. Base64 is immune to both. `-NoProfile` keeps the developer's
+# interactive profile from changing how builds behave.
+#
+# Silencing the progress stream is not cosmetic: PowerShell serializes it onto
+# stderr as CLIXML, which would otherwise be interleaved with real build output.
 remote() {
-    ssh "$ZED_WIN_HOST" powershell -NoProfile -NonInteractive -Command -
+    local script
+    script="\$ProgressPreference = 'SilentlyContinue'
+$(cat)"
+    ssh "$ZED_WIN_HOST" powershell -NoProfile -NonInteractive -EncodedCommand \
+        "$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
 }
 
 if [[ "$mode" == tail ]]; then
@@ -77,11 +89,19 @@ if [[ "$mode" == tail ]]; then
 fi
 
 if [[ "$mode" == status ]]; then
+    # Liveness is decided on the recorded process, not on the log file: the log
+    # exists from the moment the run is set up, so treating it as proof of life
+    # reports "still running" for a command that died on startup.
     remote <<PS
 if (Test-Path '${DONE}') {
     Write-Output ("finished, exit code " + (Get-Content '${DONE}' -Raw).Trim())
-} elseif (Test-Path '${LOG}') {
-    Write-Output 'still running'
+} elseif (Test-Path '${PIDFILE}') {
+    \$recorded = (Get-Content '${PIDFILE}' -Raw).Trim()
+    if (Get-Process -Id \$recorded -ErrorAction SilentlyContinue) {
+        Write-Output ("still running (pid " + \$recorded + ")")
+    } else {
+        Write-Output 'died without recording an exit code — check the log'
+    }
 } else {
     Write-Output 'no detached run recorded'
 }
@@ -124,6 +144,7 @@ if [[ $detach -eq 1 ]]; then
     remote <<PS
 New-Item -ItemType Directory -Force -Path '${ZED_WIN_REPO}\target' | Out-Null
 Remove-Item -Force -ErrorAction SilentlyContinue '${DONE}'
+Remove-Item -Force -ErrorAction SilentlyContinue '${PIDFILE}'
 Set-Content -Path '${LOG}' -Value '' -Encoding ascii
 \$runner = '${ZED_WIN_REPO}\target\winrun.cmd'
 Set-Content -Path \$runner -Encoding ascii -Value @(
@@ -131,7 +152,9 @@ Set-Content -Path \$runner -Encoding ascii -Value @(
     '${command} > "${LOG}" 2>&1',
     'echo %errorlevel% > "${DONE}"'
 )
-Start-Process -FilePath cmd.exe -ArgumentList '/c', \$runner -WindowStyle Hidden
+\$started = Start-Process -FilePath cmd.exe -ArgumentList '/c', \$runner -WindowStyle Hidden -PassThru
+Set-Content -Path '${PIDFILE}' -Value \$started.Id
+Write-Output ("started, pid " + \$started.Id)
 PS
     echo "winrun: started detached on $ZED_WIN_HOST — follow with 'script/winrun --tail'" >&2
     exit 0

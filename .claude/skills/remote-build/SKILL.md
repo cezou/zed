@@ -36,6 +36,30 @@ script/winrun --no-sync -- git rev-parse HEAD             # inspect without sync
 Use `--detach` for anything past roughly ten minutes: it runs the command through a detached
 `cmd.exe`, so the build survives an SSH drop. A plain `winrun` dies with the connection.
 
+## The dev loop: build a Linux binary and run it here
+
+`--wsl` runs in the clone inside the Windows machine's WSL distribution, so the output is a Linux
+binary that runs on this laptop. That makes the edit-test loop a few minutes instead of a release
+round-trip — no tag, no publish, no manual download.
+
+```bash
+git commit -am "..."                                       # winrun refuses a dirty tree
+script/winrun --wsl --detach -- cargo build -p zed         # dev profile, incremental
+script/winrun --wsl --status                               # or --wsl --tail
+script/winrun --wsl -- strip --strip-debug \
+    "$ZED_WSL_TARGET/debug/zed" -o /tmp/zed-dev            # shrink before the transfer
+script/winrun --wsl --pull /tmp/zed-dev ./zed-dev && chmod +x ./zed-dev
+./zed-dev
+```
+
+Build with the **dev** profile for iteration. `[profile.release]` carries `lto = "thin"` and
+`codegen-units = 1`, which is minutes per iteration for no benefit while testing behaviour; keep it
+for actual releases.
+
+`--pull` is binary-safe. It has to be: PowerShell re-encodes what native commands write to stdout,
+so piping a binary through `wsl -e cat` corrupts it. The file is staged onto the Windows filesystem
+and carried by scp over the SFTP subsystem, which never touches a shell.
+
 ## Traps
 
 - **Commit first.** `winrun` refuses to run with a dirty working tree, because the Windows machine

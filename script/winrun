@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Runs a build/test command on the Windows machine over SSH, on the exact commit
-# checked out here. See .claude/skills/remote-build/SKILL.md.
+# checked out here — natively, or inside its WSL distribution to produce Linux
+# binaries. See .claude/skills/remote-build/SKILL.md.
 
 set -euo pipefail
 
@@ -9,23 +10,28 @@ CONFIG_FILE="${ZED_WINRUN_CONFIG:-$HOME/.config/zed-winrun.env}"
 
 usage() {
     cat >&2 <<'USAGE'
-usage: script/winrun [--detach] [--no-sync] <command...>
-       script/winrun --tail
-       script/winrun --status
+usage: script/winrun [--wsl] [--detach] [--no-sync] <command...>
+       script/winrun [--wsl] --tail | --status
+       script/winrun [--wsl] --pull <remote-path> <local-path>
 
-  (default)   push the current commit, check it out on Windows, run <command>
-              there and stream its output back; exits with the command's code.
-  --detach    start <command> detached on Windows, writing to a log, and return
+  (default)   push the current commit, check it out on the Windows machine, run
+              <command> there and stream its output back; exits with its code.
+  --wsl       use the clone inside WSL instead of the Windows one, so the build
+              produces Linux binaries. Implies the WSL toolchain and target dir.
+  --detach    start <command> detached, writing to a log, and return
               immediately. Survives an SSH drop — use it for long builds.
   --tail      follow the log of the last --detach run.
   --status    report whether the last --detach run is still going.
   --no-sync   skip the git synchronization (for inspection commands).
+  --pull      copy a file back to this machine. Binary-safe.
 
-Configuration lives in ~/.config/zed-winrun.env (not in the repo, since it holds
-machine-specific paths):
+Configuration lives in ~/.config/zed-winrun.env (not in the repo, which is a
+public fork, and these are machine-specific paths):
 
   ZED_WIN_HOST=zed-win                    # a Host entry in ~/.ssh/config
-  ZED_WIN_REPO='C:\Users\you\src\zed'     # the Zed clone on the Windows machine
+  ZED_WIN_REPO='C:\Users\you\src\zed'     # the Windows clone
+  ZED_WSL_REPO=/home/you/zed              # the clone inside WSL      (--wsl)
+  ZED_WSL_TARGET=/home/you/zed-target     # CARGO_TARGET_DIR in WSL   (--wsl)
 USAGE
     exit 2
 }
@@ -42,27 +48,38 @@ source "$CONFIG_FILE"
 : "${ZED_WIN_HOST:?winrun: ZED_WIN_HOST is not set in $CONFIG_FILE}"
 : "${ZED_WIN_REPO:?winrun: ZED_WIN_REPO is not set in $CONFIG_FILE}"
 
-# Logs live under target/ because it is gitignored, absolute (no %TEMP% to
-# expand through three levels of quoting), and untouched by `git checkout`.
-LOG="${ZED_WIN_REPO}\\target\\winrun.log"
-DONE="${ZED_WIN_REPO}\\target\\winrun.done"
-PIDFILE="${ZED_WIN_REPO}\\target\\winrun.pid"
-
 detach=0
 sync=1
+wsl=0
 mode=run
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --wsl) wsl=1; shift ;;
         --detach) detach=1; shift ;;
         --no-sync) sync=0; shift ;;
         --tail) mode=tail; shift ;;
         --status) mode=status; shift ;;
+        --pull) mode=pull; shift ;;
         --) shift; break ;;
         -*) echo "winrun: unknown option $1" >&2; usage ;;
         *) break ;;
     esac
 done
+
+if [[ $wsl -eq 1 ]]; then
+    : "${ZED_WSL_REPO:?winrun: --wsl needs ZED_WSL_REPO in $CONFIG_FILE}"
+    : "${ZED_WSL_TARGET:?winrun: --wsl needs ZED_WSL_TARGET in $CONFIG_FILE}"
+    LOG="\$HOME/.winrun.log"
+    DONE="\$HOME/.winrun.done"
+    PIDFILE="\$HOME/.winrun.pid"
+else
+    # Logs live under target/ because it is gitignored, absolute (no %TEMP% to
+    # expand through several levels of quoting), and untouched by `git checkout`.
+    LOG="${ZED_WIN_REPO}\\target\\winrun.log"
+    DONE="${ZED_WIN_REPO}\\target\\winrun.done"
+    PIDFILE="${ZED_WIN_REPO}\\target\\winrun.pid"
+fi
 
 # Reads a PowerShell script on stdin and runs it on the Windows machine.
 #
@@ -75,7 +92,7 @@ done
 #
 # Silencing the progress stream is not cosmetic: PowerShell serializes it onto
 # stderr as CLIXML, which would otherwise be interleaved with real build output.
-remote() {
+remote_windows() {
     local script
     script="\$ProgressPreference = 'SilentlyContinue'
 $(cat)"
@@ -83,7 +100,54 @@ $(cat)"
         "$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
 }
 
+# Reads a bash script on stdin and runs it inside WSL. Base64 again, for the
+# same reason one level down: the script would otherwise be re-parsed by bash,
+# by PowerShell and by ssh in turn.
+remote_wsl() {
+    local encoded
+    encoded=$(cat | base64 -w0)
+    ssh "$ZED_WIN_HOST" \
+        "wsl -e bash -c 'echo $encoded | base64 -d | bash'; exit \$LASTEXITCODE"
+}
+
+remote() {
+    if [[ $wsl -eq 1 ]]; then remote_wsl; else remote_windows; fi
+}
+
+if [[ "$mode" == pull ]]; then
+    [[ $# -eq 2 ]] || usage
+    remote_path="$1"
+    local_path="$2"
+
+    if [[ $wsl -eq 1 ]]; then
+        # PowerShell re-encodes what native commands write to stdout, so piping
+        # a binary through `wsl -e cat` corrupts it. Staging the file on the
+        # Windows filesystem lets scp carry it over the SFTP subsystem instead,
+        # which never touches the shell.
+        staging_win="${ZED_WIN_REPO}\\target\\winrun-pull.bin"
+        echo "winrun: staging $remote_path onto the Windows filesystem" >&2
+        remote <<SH
+set -e
+staging=\$(wslpath -u '${staging_win}')
+mkdir -p "\$(dirname "\$staging")"
+cp '${remote_path}' "\$staging"
+SH
+        scp -q "$ZED_WIN_HOST:$(printf '%s' "$staging_win" | tr '\\' '/')" "$local_path"
+        remote <<SH
+rm -f "\$(wslpath -u '${staging_win}')"
+SH
+    else
+        scp -q "$ZED_WIN_HOST:$(printf '%s' "$remote_path" | tr '\\' '/')" "$local_path"
+    fi
+
+    echo "winrun: wrote $local_path ($(du -h "$local_path" | cut -f1))" >&2
+    exit 0
+fi
+
 if [[ "$mode" == tail ]]; then
+    if [[ $wsl -eq 1 ]]; then
+        exec ssh -t "$ZED_WIN_HOST" "wsl -e bash -c 'tail -n 200 -f \$HOME/.winrun.log'"
+    fi
     exec ssh -t "$ZED_WIN_HOST" \
         "powershell -NoProfile -Command \"Get-Content -Path '${LOG}' -Wait -Tail 200\""
 fi
@@ -92,6 +156,20 @@ if [[ "$mode" == status ]]; then
     # Liveness is decided on the recorded process, not on the log file: the log
     # exists from the moment the run is set up, so treating it as proof of life
     # reports "still running" for a command that died on startup.
+    if [[ $wsl -eq 1 ]]; then
+        remote <<'SH'
+if [ -f "$HOME/.winrun.done" ]; then
+    echo "finished, exit code $(cat "$HOME/.winrun.done")"
+elif [ -f "$HOME/.winrun.pid" ] && kill -0 "$(cat "$HOME/.winrun.pid")" 2>/dev/null; then
+    echo "still running (pid $(cat "$HOME/.winrun.pid"))"
+elif [ -f "$HOME/.winrun.pid" ]; then
+    echo "died without recording an exit code - check the log"
+else
+    echo "no detached run recorded"
+fi
+SH
+        exit $?
+    fi
     remote <<PS
 if (Test-Path '${DONE}') {
     Write-Output ("finished, exit code " + (Get-Content '${DONE}' -Raw).Trim())
@@ -100,7 +178,7 @@ if (Test-Path '${DONE}') {
     if (Get-Process -Id \$recorded -ErrorAction SilentlyContinue) {
         Write-Output ("still running (pid " + \$recorded + ")")
     } else {
-        Write-Output 'died without recording an exit code — check the log'
+        Write-Output 'died without recording an exit code - check the log'
     }
 } else {
     Write-Output 'no detached run recorded'
@@ -117,7 +195,7 @@ if [[ $sync -eq 1 ]]; then
     commit=$(git rev-parse HEAD)
 
     if ! git diff --quiet || ! git diff --cached --quiet; then
-        echo "winrun: refusing to run — you have uncommitted changes, so the Windows" >&2
+        echo "winrun: refusing to run — you have uncommitted changes, so the remote" >&2
         echo "        machine would build something other than your working tree." >&2
         exit 1
     fi
@@ -128,27 +206,69 @@ if [[ $sync -eq 1 ]]; then
     # Detaching onto the SHA rather than checking out the branch keeps the two
     # machines provably on the same code even if the branch moves meanwhile.
     echo "winrun: checking out $commit on $ZED_WIN_HOST" >&2
-    remote <<PS
+    if [[ $wsl -eq 1 ]]; then
+        remote <<SH
+set -e
+cd '${ZED_WSL_REPO}'
+git fetch --quiet origin
+git checkout --quiet --detach ${commit}
+SH
+    else
+        remote <<PS
 Set-Location '${ZED_WIN_REPO}'
 git fetch --quiet origin
 if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
 git checkout --quiet --detach ${commit}
 exit \$LASTEXITCODE
 PS
+    fi
 fi
 
 if [[ $detach -eq 1 ]]; then
-    # The command goes into a .cmd file, which keeps the redirection out of
-    # PowerShell's quoting, and that file is started through WMI rather than
-    # Start-Process. Windows OpenSSH puts each session in a job object and kills
-    # every descendant when the connection closes, so a Start-Process child dies
-    # with the SSH session — measured, not assumed. A process created by the WMI
-    # service is not a descendant of the session, so it survives.
-    #
-    # The price is that it starts in session 0 with the *machine* environment,
-    # losing the user PATH that rustup installs into — hence baking this
-    # session's PATH into the script rather than relying on inheritance.
-    remote <<PS
+    if [[ $wsl -eq 1 ]]; then
+        # A detached WSL build needs *both* tricks. nohup alone is not enough:
+        # WSL shuts the distribution down once the last wsl.exe session ends,
+        # taking background processes with it — measured, a build died mid-way
+        # with its log frozen. So a Windows-side process holds a wsl.exe session
+        # open for the whole build, and that process is created through WMI so
+        # it is not a descendant of the SSH session's job object. wsl.exe does
+        # run from the session 0 that WMI places it in — also measured.
+        inner=$(cat <<SH | base64 -w0
+export PATH="\$HOME/.cargo/bin:\$PATH"
+export CARGO_TARGET_DIR='${ZED_WSL_TARGET}'
+cd '${ZED_WSL_REPO}'
+echo \$\$ > "\$HOME/.winrun.pid"
+rm -f "\$HOME/.winrun.done"
+${command} > "\$HOME/.winrun.log" 2>&1
+echo \$? > "\$HOME/.winrun.done"
+SH
+)
+        remote_windows <<PS
+New-Item -ItemType Directory -Force -Path '${ZED_WIN_REPO}\target' | Out-Null
+\$runner = '${ZED_WIN_REPO}\target\winrun-wsl.cmd'
+Set-Content -Path \$runner -Encoding ascii -Value @(
+    '@echo off',
+    'wsl -e bash -c "echo ${inner} | base64 -d | bash"'
+)
+\$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'cmd.exe /c "' + \$runner + '"' }
+if (\$created.ReturnValue -ne 0) {
+    Write-Error ("Win32_Process.Create failed with " + \$created.ReturnValue)
+    exit 1
+}
+Write-Output ("started, windows pid " + \$created.ProcessId)
+PS
+    else
+        # The command goes into a .cmd file, which keeps the redirection out of
+        # PowerShell's quoting, and that file is started through WMI rather than
+        # Start-Process. Windows OpenSSH puts each session in a job object and
+        # kills every descendant when the connection closes, so a Start-Process
+        # child dies with the SSH session — measured, not assumed. A process
+        # created by the WMI service is not a descendant of the session.
+        #
+        # The price is that it starts in session 0 with the *machine*
+        # environment, losing the user PATH that rustup installs into — hence
+        # baking this session's PATH into the script rather than inheriting it.
+        remote <<PS
 New-Item -ItemType Directory -Force -Path '${ZED_WIN_REPO}\target' | Out-Null
 Remove-Item -Force -ErrorAction SilentlyContinue '${DONE}'
 Remove-Item -Force -ErrorAction SilentlyContinue '${PIDFILE}'
@@ -169,12 +289,24 @@ if (\$created.ReturnValue -ne 0) {
 Set-Content -Path '${PIDFILE}' -Value \$created.ProcessId
 Write-Output ("started, pid " + \$created.ProcessId)
 PS
-    echo "winrun: started detached on $ZED_WIN_HOST — follow with 'script/winrun --tail'" >&2
+    fi
+    follow="script/winrun --tail"
+    [[ $wsl -eq 1 ]] && follow="script/winrun --wsl --tail"
+    echo "winrun: started detached — follow with '$follow'" >&2
     exit 0
 fi
 
-remote <<PS
+if [[ $wsl -eq 1 ]]; then
+    remote <<SH
+export PATH="\$HOME/.cargo/bin:\$PATH"
+export CARGO_TARGET_DIR='${ZED_WSL_TARGET}'
+cd '${ZED_WSL_REPO}'
+${command}
+SH
+else
+    remote <<PS
 Set-Location '${ZED_WIN_REPO}'
 ${command}
 exit \$LASTEXITCODE
 PS
+fi

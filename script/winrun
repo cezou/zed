@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+
+# Runs a build/test command on the Windows machine over SSH, on the exact commit
+# checked out here. See .claude/skills/remote-build/SKILL.md.
+
+set -euo pipefail
+
+CONFIG_FILE="${ZED_WINRUN_CONFIG:-$HOME/.config/zed-winrun.env}"
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: script/winrun [--detach] [--no-sync] <command...>
+       script/winrun --tail
+       script/winrun --status
+
+  (default)   push the current commit, check it out on Windows, run <command>
+              there and stream its output back; exits with the command's code.
+  --detach    start <command> detached on Windows, writing to a log, and return
+              immediately. Survives an SSH drop — use it for long builds.
+  --tail      follow the log of the last --detach run.
+  --status    report whether the last --detach run is still going.
+  --no-sync   skip the git synchronization (for inspection commands).
+
+Configuration lives in ~/.config/zed-winrun.env (not in the repo, since it holds
+machine-specific paths):
+
+  ZED_WIN_HOST=zed-win                    # a Host entry in ~/.ssh/config
+  ZED_WIN_REPO='C:\Users\you\src\zed'     # the Zed clone on the Windows machine
+USAGE
+    exit 2
+}
+
+case "${1:-}" in -h|--help) usage ;; esac
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "winrun: missing $CONFIG_FILE — run 'script/winrun --help' for its contents" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+: "${ZED_WIN_HOST:?winrun: ZED_WIN_HOST is not set in $CONFIG_FILE}"
+: "${ZED_WIN_REPO:?winrun: ZED_WIN_REPO is not set in $CONFIG_FILE}"
+
+# Logs live under target/ because it is gitignored, absolute (no %TEMP% to
+# expand through three levels of quoting), and untouched by `git checkout`.
+LOG="${ZED_WIN_REPO}\\target\\winrun.log"
+DONE="${ZED_WIN_REPO}\\target\\winrun.done"
+
+detach=0
+sync=1
+mode=run
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --detach) detach=1; shift ;;
+        --no-sync) sync=0; shift ;;
+        --tail) mode=tail; shift ;;
+        --status) mode=status; shift ;;
+        --) shift; break ;;
+        -*) echo "winrun: unknown option $1" >&2; usage ;;
+        *) break ;;
+    esac
+done
+
+# Feeds a PowerShell script over stdin rather than as a command-line argument:
+# the remote default shell re-parses anything passed as an argument, and the
+# resulting bash/ssh/pwsh quoting is unmaintainable. `-NoProfile` also keeps the
+# developer's interactive profile from changing how builds behave.
+remote() {
+    ssh "$ZED_WIN_HOST" powershell -NoProfile -NonInteractive -Command -
+}
+
+if [[ "$mode" == tail ]]; then
+    exec ssh -t "$ZED_WIN_HOST" \
+        "powershell -NoProfile -Command \"Get-Content -Path '${LOG}' -Wait -Tail 200\""
+fi
+
+if [[ "$mode" == status ]]; then
+    remote <<PS
+if (Test-Path '${DONE}') {
+    Write-Output ("finished, exit code " + (Get-Content '${DONE}' -Raw).Trim())
+} elseif (Test-Path '${LOG}') {
+    Write-Output 'still running'
+} else {
+    Write-Output 'no detached run recorded'
+}
+PS
+    exit $?
+fi
+
+[[ $# -gt 0 ]] || usage
+command="$*"
+
+if [[ $sync -eq 1 ]]; then
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    commit=$(git rev-parse HEAD)
+
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "winrun: refusing to run — you have uncommitted changes, so the Windows" >&2
+        echo "        machine would build something other than your working tree." >&2
+        exit 1
+    fi
+
+    echo "winrun: pushing $branch ($commit)" >&2
+    git push --quiet origin "HEAD:refs/heads/$branch"
+
+    # Detaching onto the SHA rather than checking out the branch keeps the two
+    # machines provably on the same code even if the branch moves meanwhile.
+    echo "winrun: checking out $commit on $ZED_WIN_HOST" >&2
+    remote <<PS
+Set-Location '${ZED_WIN_REPO}'
+git fetch --quiet origin
+if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
+git checkout --quiet --detach ${commit}
+exit \$LASTEXITCODE
+PS
+fi
+
+if [[ $detach -eq 1 ]]; then
+    # The command is written to a .cmd file and started through Start-Process:
+    # that detaches it from this SSH session, so it outlives a dropped
+    # connection, and it keeps the redirection out of PowerShell's quoting.
+    remote <<PS
+New-Item -ItemType Directory -Force -Path '${ZED_WIN_REPO}\target' | Out-Null
+Remove-Item -Force -ErrorAction SilentlyContinue '${DONE}'
+Set-Content -Path '${LOG}' -Value '' -Encoding ascii
+\$runner = '${ZED_WIN_REPO}\target\winrun.cmd'
+Set-Content -Path \$runner -Encoding ascii -Value @(
+    'cd /d "${ZED_WIN_REPO}"',
+    '${command} > "${LOG}" 2>&1',
+    'echo %errorlevel% > "${DONE}"'
+)
+Start-Process -FilePath cmd.exe -ArgumentList '/c', \$runner -WindowStyle Hidden
+PS
+    echo "winrun: started detached on $ZED_WIN_HOST — follow with 'script/winrun --tail'" >&2
+    exit 0
+fi
+
+remote <<PS
+Set-Location '${ZED_WIN_REPO}'
+${command}
+exit \$LASTEXITCODE
+PS

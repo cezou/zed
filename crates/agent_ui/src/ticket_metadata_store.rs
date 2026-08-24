@@ -38,6 +38,10 @@ impl TicketId {
 pub enum TicketLaunchKind {
     Initial,
     Additional,
+    /// Started by handing the worktree to `claude --resume` so Claude's own
+    /// picker could continue a session Zed never launched. Such a session has
+    /// no `cc_session_id`: the id lives only in Claude's history.
+    Resumed,
 }
 
 impl TicketLaunchKind {
@@ -45,12 +49,14 @@ impl TicketLaunchKind {
         match self {
             Self::Initial => "initial",
             Self::Additional => "additional",
+            Self::Resumed => "resumed",
         }
     }
 
     fn from_str(value: &str) -> Self {
         match value {
             "additional" => Self::Additional,
+            "resumed" => Self::Resumed,
             _ => Self::Initial,
         }
     }
@@ -905,12 +911,33 @@ async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<Path
         );
     }
 
+    let list = gtr_list(repo_path).await?;
+    worktree_path_for_branch(&list, branch_name)
+        .with_context(|| format!("git gtr list did not report a worktree for branch {branch_name}"))
+}
+
+/// A worktree as `git gtr list --porcelain` reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GtrWorktree {
+    pub path: PathBuf,
+    pub branch: String,
+}
+
+/// Every worktree `gtr` reports for `repo_path`, so a ticket can be attached
+/// to one that already exists instead of cutting a new one. The repository's
+/// main worktree is in there too: working straight in the checkout the
+/// repository was registered from is a legitimate choice.
+pub async fn existing_worktrees(repo_path: &Path) -> anyhow::Result<Vec<GtrWorktree>> {
+    Ok(parse_gtr_worktrees(&gtr_list(repo_path).await?))
+}
+
+async fn gtr_list(repo_path: &Path) -> anyhow::Result<String> {
     let list = smol::process::Command::new("git")
         .args(["gtr", "list", "--porcelain"])
         .current_dir(repo_path)
         .output()
         .await
-        .context("failed to run `git gtr list`")?;
+        .context("failed to run `git gtr list` — is git-worktree-runner installed and on PATH?")?;
 
     if !list.status.success() {
         anyhow::bail!(
@@ -919,21 +946,32 @@ async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<Path
         );
     }
 
-    worktree_path_for_branch(&String::from_utf8_lossy(&list.stdout), branch_name)
-        .with_context(|| format!("git gtr list did not report a worktree for branch {branch_name}"))
+    Ok(String::from_utf8_lossy(&list.stdout).into_owned())
 }
 
-/// Picks a branch's worktree path out of `git gtr list --porcelain` output,
-/// whose records are `<path>\t<branch>\t<hook_status>`.
-fn worktree_path_for_branch(list_output: &str, branch_name: &str) -> Option<PathBuf> {
+/// Parses `git gtr list --porcelain` output, whose records are
+/// `<path>\t<branch>\t<hook_status>`.
+fn parse_gtr_worktrees(list_output: &str) -> Vec<GtrWorktree> {
     list_output
         .lines()
         .filter_map(|line| {
             let mut fields = line.split('\t');
-            Some((fields.next()?, fields.next()?))
+            let path = fields.next()?;
+            let branch = fields.next()?;
+            (!path.is_empty() && !branch.is_empty()).then(|| GtrWorktree {
+                path: PathBuf::from(path),
+                branch: branch.to_string(),
+            })
         })
-        .find(|(_, branch)| *branch == branch_name)
-        .map(|(path, _)| PathBuf::from(path))
+        .collect()
+}
+
+/// Picks a branch's worktree path out of `git gtr list --porcelain` output.
+fn worktree_path_for_branch(list_output: &str, branch_name: &str) -> Option<PathBuf> {
+    parse_gtr_worktrees(list_output)
+        .into_iter()
+        .find(|worktree| worktree.branch == branch_name)
+        .map(|worktree| worktree.path)
 }
 
 /// The per-worktree mirror directory for a ticket's brief and attachments.
@@ -992,12 +1030,35 @@ pub struct TicketLaunchSpec {
     pub attachments: Vec<PathBuf>,
 }
 
+/// Which kind of `claude` session the launch modal asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TicketSessionStart {
+    /// Mirror the brief into the worktree and start a fresh session pointed at
+    /// it — what launching a ticket has always meant.
+    Brief(TicketLaunchSpec),
+    /// Run bare `claude --resume` in the worktree and let Claude's own picker
+    /// pick the session to continue. Used to adopt work started outside Zed,
+    /// so there is no brief and no prompt to send.
+    ResumePicker,
+}
+
 /// What the launch command references: worktree-relative paths into
 /// [`WORKTREE_MIRROR_DIR`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TicketLaunchFiles {
     pub brief_relative_path: String,
     pub attachment_relative_paths: Vec<String>,
+}
+
+/// What the agent panel spawns a ticket terminal with, once the brief (if any)
+/// has been written out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TicketTerminalLaunch {
+    Brief {
+        launch_files: TicketLaunchFiles,
+        launch_kind: TicketLaunchKind,
+    },
+    ResumePicker,
 }
 
 /// Writes the brief and attachments to their canonical location and mirrors
@@ -1186,13 +1247,12 @@ async fn launch_spec_from_canonical(
     })
 }
 
-/// Spawns a fresh `claude` CLI session for a ticket in the given worktree,
-/// via the workspace's `AgentPanel`.
+/// Spawns a `claude` CLI session for a ticket in the given worktree, via the
+/// workspace's `AgentPanel`.
 async fn launch_ticket_session(
     ticket_id: TicketId,
     worktree_path: PathBuf,
-    launch_files: TicketLaunchFiles,
-    launch_kind: TicketLaunchKind,
+    launch: TicketTerminalLaunch,
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
@@ -1203,9 +1263,29 @@ async fn launch_ticket_session(
 
     window.update(cx, |_multi_workspace, window, cx| {
         agent_panel.update(cx, |panel, cx| {
-            panel.spawn_ticket_terminal(ticket_id, launch_kind, launch_files, window, cx)
+            panel.spawn_ticket_terminal(ticket_id, launch, window, cx)
         })
     })?
+}
+
+/// Turns the modal's choice into what the agent panel needs: a brief-driven
+/// start has to be materialized into the worktree first, a resume has nothing
+/// to write. `launch_kind` only describes the brief case; a resume is always
+/// recorded as [`TicketLaunchKind::Resumed`].
+async fn terminal_launch_for(
+    start: TicketSessionStart,
+    ticket_id: &TicketId,
+    worktree_path: &Path,
+    launch_kind: TicketLaunchKind,
+    fs: &Arc<dyn Fs>,
+) -> anyhow::Result<TicketTerminalLaunch> {
+    Ok(match start {
+        TicketSessionStart::Brief(spec) => TicketTerminalLaunch::Brief {
+            launch_files: materialize_brief(fs, ticket_id, worktree_path, &spec).await?,
+            launch_kind,
+        },
+        TicketSessionStart::ResumePicker => TicketTerminalLaunch::ResumePicker,
+    })
 }
 
 /// Creates a git worktree for a ticket via `git gtr new` (running any
@@ -1240,17 +1320,54 @@ pub async fn create_worktree_and_launch(
         )
     })?;
 
-    let launch_files = materialize_brief(&fs, &ticket_id, &worktree_path, &spec).await?;
+    let launch = TicketTerminalLaunch::Brief {
+        launch_files: materialize_brief(&fs, &ticket_id, &worktree_path, &spec).await?,
+        launch_kind: TicketLaunchKind::Initial,
+    };
 
-    launch_ticket_session(
-        ticket_id,
-        worktree_path,
-        launch_files,
-        TicketLaunchKind::Initial,
-        app_state,
-        cx,
-    )
-    .await
+    launch_ticket_session(ticket_id, worktree_path, launch, app_state, cx).await
+}
+
+/// Attaches a ticket to a worktree that already exists — no `git gtr new`, no
+/// new branch — and starts a session in it: either a fresh brief-driven one or
+/// a `claude --resume` handing the choice of session to Claude's own picker.
+///
+/// The worktree is recorded exactly as a freshly cut one is, so the ticket
+/// becomes resumable through [`open_ticket`] and its sessions are counted in
+/// the sidebar.
+pub async fn attach_worktree_and_launch(
+    ticket_id: TicketId,
+    repo_path: PathBuf,
+    worktree_path: PathBuf,
+    branch_name: String,
+    start: TicketSessionStart,
+    fs: Arc<dyn Fs>,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    // Same courtesy as on a fresh worktree, and idempotent: a repository
+    // layout that defeats it must not stop the session launching.
+    exclude_mirror_from_git(&fs, &worktree_path).await.log_err();
+
+    let ticket_store = cx.update(|cx| TicketMetadataStore::global(cx));
+    let launch_kind = ticket_store.read_with(cx, |store, _cx| match store.entry(&ticket_id) {
+        Some(entry) if !entry.sessions.is_empty() => TicketLaunchKind::Additional,
+        _ => TicketLaunchKind::Initial,
+    });
+    ticket_store.update(cx, |store, cx| {
+        store.save_worktree(
+            &ticket_id,
+            worktree_path.clone(),
+            branch_name,
+            repo_path,
+            None,
+            cx,
+        )
+    })?;
+
+    let launch = terminal_launch_for(start, &ticket_id, &worktree_path, launch_kind, &fs).await?;
+
+    launch_ticket_session(ticket_id, worktree_path, launch, app_state, cx).await
 }
 
 /// Opens a ticket whose worktree already exists: focuses/opens the
@@ -1315,11 +1432,12 @@ pub async fn open_ticket(
     Ok(())
 }
 
-/// Launches an additional, independent Claude Code session for a ticket
-/// that already has a worktree (and possibly other sessions running).
+/// Launches one more independent Claude Code session for a ticket that already
+/// has a worktree (and possibly other sessions running) — brief-driven, or a
+/// `claude --resume` adopting a session started outside Zed.
 pub async fn launch_additional_session(
     ticket_id: TicketId,
-    spec: TicketLaunchSpec,
+    start: TicketSessionStart,
     fs: Arc<dyn Fs>,
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
@@ -1333,17 +1451,16 @@ pub async fn launch_additional_session(
         })
         .context("ticket has no worktree yet")?;
 
-    let launch_files = materialize_brief(&fs, &ticket_id, &worktree_path, &spec).await?;
-
-    launch_ticket_session(
-        ticket_id,
-        worktree_path,
-        launch_files,
+    let launch = terminal_launch_for(
+        start,
+        &ticket_id,
+        &worktree_path,
         TicketLaunchKind::Additional,
-        app_state,
-        cx,
+        &fs,
     )
-    .await
+    .await?;
+
+    launch_ticket_session(ticket_id, worktree_path, launch, app_state, cx).await
 }
 
 #[cfg(test)]
@@ -1499,6 +1616,32 @@ mod tests {
         );
         assert_eq!(worktree_path_for_branch(list_output, "spider"), None);
         assert_eq!(worktree_path_for_branch("", "spider-fix"), None);
+    }
+
+    #[test]
+    fn test_parse_gtr_worktrees() {
+        let list_output = concat!(
+            "C:/Users/dev/repo\tmain\tok\n",
+            "C:/Users/dev/repo-worktrees/feature-user-auth\tfeature/user-auth\thooks-failed\n",
+            "\n",
+        );
+
+        assert_eq!(
+            parse_gtr_worktrees(list_output),
+            vec![
+                GtrWorktree {
+                    path: PathBuf::from("C:/Users/dev/repo"),
+                    branch: "main".to_string(),
+                },
+                GtrWorktree {
+                    path: PathBuf::from("C:/Users/dev/repo-worktrees/feature-user-auth"),
+                    branch: "feature/user-auth".to_string(),
+                },
+            ]
+        );
+        assert_eq!(parse_gtr_worktrees(""), Vec::new());
+        // A record `gtr` truncated to a bare path has no branch to attach to.
+        assert_eq!(parse_gtr_worktrees("C:/Users/dev/repo\n"), Vec::new());
     }
 
     fn display_fields(title: &str, url: &str, status: Option<&str>) -> TicketDisplayFields {
@@ -1806,5 +1949,52 @@ mod tests {
         cx.run_until_parked();
         assert!(db.list_worktrees().unwrap().is_empty());
         assert!(db.list_sessions().unwrap().is_empty());
+    }
+
+    /// A session adopted through Claude's own picker has no session id to
+    /// record, which the schema has to survive: `cc_session_id` is the column
+    /// every other code path fills in.
+    #[gpui::test]
+    async fn test_resumed_session_round_trips_without_a_session_id(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let ticket_id = TicketId::new("notion-page-3");
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx).update(cx, |store, cx| {
+                store.upsert_ticket_ref(
+                    ticket_id.clone(),
+                    display_fields("Adopt a session", "https://notion.so/ticket-3", None),
+                    cx,
+                );
+            });
+        });
+
+        let terminal_id = TerminalId::new();
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx)
+                .update(cx, |store, cx| {
+                    store.add_session(
+                        &ticket_id,
+                        TicketSessionRecord {
+                            terminal_id,
+                            cc_session_id: None,
+                            launch_kind: TicketLaunchKind::Resumed,
+                            created_at: Utc::now(),
+                            last_resumed_at: None,
+                            ended_at: None,
+                        },
+                        cx,
+                    )
+                })
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let db = cx.update(|cx| TicketMetadataStore::global(cx).read(cx).db.clone());
+        let persisted = db.list_sessions().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].0, ticket_id);
+        assert_eq!(persisted[0].1.cc_session_id, None);
+        assert_eq!(persisted[0].1.launch_kind, TicketLaunchKind::Resumed);
     }
 }

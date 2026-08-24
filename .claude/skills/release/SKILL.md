@@ -42,6 +42,15 @@ description: Cut a release of this Zed fork — build, package, tag, publish on 
    Compress-Archive -Path target\release\zed.exe, LICENSE-GPL, LICENSE-APACHE `
        -DestinationPath zed-windows-x86_64-<name>.zip -Force
    ```
+
+   The Windows **release** build needs `cmake` — `wasmtime-c-api-impl`'s build script spawns it,
+   and the debug build does not pull that crate, so this only bites here. It is not on PATH but
+   Visual Studio ships one; prepend it rather than installing anything:
+   ```
+   C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin
+   ```
+   (Same missing `cmake` is why `./script/clippy`, which passes `--release --all-features`, cannot
+   run on this machine; `cargo clippy --workspace --all-targets` is the working substitute.)
 5. **Tag**: `git tag -a v<zed-version>-<name> -m "<summary>"`.
 6. **Push the tag** — not `main` (never force-push `main` yourself; that stays the user's call):
    ```

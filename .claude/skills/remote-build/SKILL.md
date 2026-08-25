@@ -51,13 +51,26 @@ round-trip — no tag, no publish, no manual download.
 
 ```bash
 git commit -am "..."                                       # winrun refuses a dirty tree
-script/winrun --wsl --detach -- cargo build -p zed         # dev profile, incremental
+script/winrun --wsl --detach -- cargo build --profile release-fast -p zed
 script/winrun --wsl --status                               # or --wsl --tail
 script/winrun --wsl -- 'strip --strip-debug \
-    $ZED_WSL_TARGET/debug/zed -o $HOME/zed-dev'            # shrink before the transfer
-script/winrun --wsl --pull '$HOME/zed-dev' ./zed-dev && chmod +x ./zed-dev
-./zed-dev
+    $ZED_WSL_TARGET/release-fast/zed -o $HOME/zed-rf'      # shrink before the transfer
+script/winrun --wsl --pull '$HOME/zed-rf' ./zed-rf && chmod +x ./zed-rf
+pkill -x zed-rf                                            # never `pkill zed`
+./zed-rf
 ```
+
+Build **`release-fast`** (`inherits = "release"`, no LTO, 16 codegen units), not the dev profile.
+Only a release profile turns `debug_assertions` off, which is what makes `rust-embed` actually embed
+the assets — a dev binary reads them off disk at the build machine's path and needs the bind mount
+below. `release-fast` is self-contained and runs from anywhere. A full build measured 11m30 on this
+setup, and the stripped binary is 580 MB against 1.1 GB for the dev one.
+
+Close the running instance before launching the new one. This fork's channel is `dev`
+(`crates/zed/RELEASE_CHANNEL`), so `main.rs` skips the single-instance check and every launch opens a
+*new* window — and both instances then write the same `db/0-dev` SQLite, clobbering each other's
+tickets and sessions. Match the binary's exact name (`pkill -x zed-rf`): `pkill zed` matches every
+other build lying around.
 
 Stage artifacts under `$HOME` in WSL, not `/tmp`: the distribution is shut down and restarted
 between winrun invocations, and `/tmp` does not survive it.

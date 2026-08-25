@@ -440,6 +440,30 @@ impl NotionClient {
         Ok(tickets)
     }
 
+    /// Writes a new value into a ticket page's status property.
+    ///
+    /// `page_id` must be the page's UUID (see [`TicketRef::notion_page_uuid`]).
+    pub async fn set_ticket_status(
+        &self,
+        page_id: &str,
+        status_property: &str,
+        status_property_kind: StatusPropertyKind,
+        status: &str,
+    ) -> Result<(), NotionError> {
+        let status_key = match status_property_kind {
+            StatusPropertyKind::Status => "status",
+            StatusPropertyKind::Select => "select",
+        };
+        let body = json!({
+            "properties": {
+                status_property: { status_key: { "name": status } }
+            }
+        });
+        self.request(Method::PATCH, &format!("/pages/{page_id}"), Some(body))
+            .await?;
+        Ok(())
+    }
+
     /// Runs [`Self::query_tickets`] once and reports the result via
     /// `on_result`. Single call, no scheduling — see [`refresh_loop`] for a
     /// recurring background refresh.

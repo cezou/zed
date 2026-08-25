@@ -8,6 +8,8 @@ pub mod ticket_sync_settings;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
+
 use agent_ui::ticket_metadata_store::{
     TicketDisplayFields, TicketId, TicketMetadataStore, TicketWorktreeRecord,
 };
@@ -64,8 +66,134 @@ pub fn init(cx: &mut App) {
                 open_ticket_launch_modal(workspace, action, window, cx);
             },
         );
+        workspace.register_action(
+            |workspace, action: &agent_ui::SetTicketStatus, _window, cx| {
+                set_ticket_status(workspace, action, cx);
+            },
+        );
     })
     .detach();
+}
+
+/// Handles a status change requested from the sidebar or the launch modal:
+/// updates the store right away so the UI reflects the new status, then writes
+/// it to Notion, rolling the store back and reporting the failure if the write
+/// doesn't land. Without the optimistic update the chip would keep showing the
+/// old status until the next poll, up to `refresh_interval_secs` later.
+pub(crate) fn set_ticket_status(
+    workspace: &mut Workspace,
+    action: &agent_ui::SetTicketStatus,
+    cx: &mut Context<Workspace>,
+) {
+    let ticket_id = TicketId::new(action.ticket_id.clone());
+    let Some(store) = TicketMetadataStore::try_global(cx) else {
+        return;
+    };
+    let Some(record) = store.read(cx).entry(&ticket_id).cloned() else {
+        log::error!("cannot set the status of unknown ticket {ticket_id:?}");
+        return;
+    };
+    let status = SharedString::from(action.status.clone());
+    if record.status.as_ref() == Some(&status) {
+        return;
+    }
+    let previous_status = record.status.clone();
+
+    let Some(status_property) = TicketSyncSettings::get_global(cx)
+        .notion_status_property
+        .clone()
+    else {
+        workspace.show_error(
+            "Notion's status property isn't known yet — run \"notion: Connect to Notion\" first."
+                .to_string(),
+            cx,
+        );
+        return;
+    };
+    // The store's ticket id is the page URL's slug-plus-id segment on the
+    // OAuth/MCP path, which neither API accepts as a page id.
+    let page_uuid = notion_client::extract_page_id(&record.url);
+    let http_client = cx.http_client();
+
+    store
+        .update(cx, |store, cx| {
+            store.set_status(&ticket_id, Some(status.clone()), cx)
+        })
+        .log_err();
+
+    cx.spawn(async move |workspace, cx| {
+        let result = write_status_to_notion(
+            http_client,
+            &page_uuid,
+            &status_property,
+            status.as_ref(),
+            cx,
+        )
+        .await;
+        if let Err(error) = result {
+            store
+                .update(cx, |store, cx| {
+                    store.set_status(&ticket_id, previous_status, cx)
+                })
+                .log_err();
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(
+                        format!("Couldn't update the ticket's status in Notion: {error:#}"),
+                        cx,
+                    );
+                })
+                .ok();
+        }
+    })
+    .detach();
+}
+
+/// Writes one status value through whichever Notion credential is configured,
+/// preferring OAuth/MCP for the same reason [`TicketSyncService::start_refresh`]
+/// does.
+async fn write_status_to_notion(
+    http_client: Arc<dyn HttpClient>,
+    page_uuid: &str,
+    status_property: &str,
+    status: &str,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    if let Some(tokens) = cx.update(|cx| oauth_store::load_tokens(cx)).await {
+        let mut client = McpClient::new(http_client, tokens);
+        let result = async {
+            client.initialize().await?;
+            notion_client::mcp_board::set_page_status(
+                &mut client,
+                page_uuid,
+                status_property,
+                status,
+            )
+            .await
+        }
+        .await;
+        if let Some(refreshed) = client.refreshed_tokens() {
+            let store_task = cx.update(|cx| oauth_store::store_tokens(refreshed, cx));
+            store_task.await.log_err();
+        }
+        return result.map_err(anyhow::Error::from);
+    }
+
+    let token = cx
+        .update(|cx| token_store::load_token(cx))
+        .await
+        .context("no Notion credentials are configured")?;
+    // Same assumption as `refresh_loop_rest`: the board's tracked property is
+    // a real `status` one, not a `select` masquerading as it.
+    NotionClient::new(http_client, token)
+        .set_ticket_status(
+            page_uuid,
+            status_property,
+            notion_client::StatusPropertyKind::Status,
+            status,
+        )
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 /// Handles the sidebar's request to start work on a ticket. The sidebar only
@@ -383,6 +511,7 @@ impl TicketSyncService {
         let settings = TicketSyncSettings::get_global(cx).clone();
         let interval = Duration::from_secs(settings.refresh_interval_secs.max(30));
         let http_client = cx.http_client();
+        publish_status_options(&settings, cx);
 
         self.status = LoadStatus::Loading;
         let service = cx.entity().downgrade();
@@ -547,6 +676,21 @@ async fn refresh_loop_mcp(
         }
         cx.background_executor().timer(interval).await;
     }
+}
+
+/// Hands the board's tracked status options to the store, which is where the
+/// sidebar's status picker reads them from — it renders the ticket rows but
+/// deliberately doesn't depend on the Notion crates.
+fn publish_status_options(settings: &TicketSyncSettings, cx: &mut App) {
+    let Some(store) = TicketMetadataStore::try_global(cx) else {
+        return;
+    };
+    let options = settings
+        .notion_status_filter
+        .iter()
+        .map(|status| SharedString::from(status.clone()))
+        .collect();
+    store.update(cx, |store, cx| store.set_status_options(options, cx));
 }
 
 fn upsert_tickets_into_store(tickets: &[TicketRef], cx: &mut App) {

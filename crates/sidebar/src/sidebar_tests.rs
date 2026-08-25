@@ -15373,7 +15373,7 @@ async fn test_ticket_without_worktree_lands_in_ready_for_dev(cx: &mut TestAppCon
         visible_entries_as_strings(&sidebar, cx),
         vec![
             "v [my-project]",
-            "v (Ready for Dev)",
+            "v (No sessions)",
             "  > #Not started yet"
         ]
     );

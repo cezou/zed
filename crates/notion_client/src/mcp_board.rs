@@ -475,6 +475,36 @@ pub async fn query_tickets(
         .collect())
 }
 
+/// Writes a new value into the board's status property for one page.
+///
+/// `page_uuid` must be the page's real UUID: on this path
+/// [`TicketRef::page_id`] is the URL's slug-plus-id segment, which
+/// `notion-update-page` rejects — use [`TicketRef::notion_page_uuid`].
+pub async fn set_page_status(
+    client: &mut McpClient,
+    page_uuid: &str,
+    status_property: &str,
+    status: &str,
+) -> Result<(), McpError> {
+    let result = client
+        .call_tool(
+            "notion-update-page",
+            json!({
+                "page_id": page_uuid,
+                "command": "update_properties",
+                "properties": { status_property: status },
+            }),
+        )
+        .await?;
+    if result.is_error {
+        return Err(McpError::Other(format!(
+            "notion-update-page returned an error: {}",
+            result.joined_text()
+        )));
+    }
+    Ok(())
+}
+
 fn parse_row(
     row: &Value,
     title_property: &str,

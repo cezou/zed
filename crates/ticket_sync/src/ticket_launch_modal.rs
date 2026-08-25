@@ -16,7 +16,7 @@ use editor::{Editor, EditorElement, EditorStyle};
 use fs::Fs;
 use gpui::{
     AppContext as _, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Image, Task,
-    TextStyle, actions, img, px,
+    TextStyle, WeakEntity, actions, img, px,
 };
 use notion_client::TicketRef;
 use notion_client::mcp::McpClient;
@@ -31,6 +31,7 @@ use workspace::{ModalView, Workspace};
 use crate::clipboard_images::{self, SavedImage};
 use crate::repository_registry::{self, TicketRepository};
 use crate::ticket_brief::render_brief;
+use crate::ticket_sync_settings::TicketSyncSettings;
 
 actions!(
     tickets,
@@ -82,6 +83,23 @@ enum BodyState {
     Failed(SharedString),
 }
 
+/// The status a launch moves the ticket to unless the user picks another one:
+/// the board's "in progress" option, recognized the same way
+/// [`ui::ticket_status_color`] does — by substring, since the option strings
+/// carry per-board numbering and emoji (`"3 - ⏳ In progress"`).
+///
+/// `None` when the board has no such option or the ticket is already there,
+/// which renders as "Keep as is" and writes nothing.
+fn default_target_status(current: &str, cx: &App) -> Option<SharedString> {
+    TicketSyncSettings::get_global(cx)
+        .notion_status_filter
+        .iter()
+        .find(|option| {
+            option.to_lowercase().contains("progress") && option.as_str() != current
+        })
+        .map(|option| SharedString::from(option.clone()))
+}
+
 enum WorktreesState {
     Loading,
     Ready,
@@ -92,6 +110,12 @@ pub struct TicketLaunchModal {
     ticket: TicketRef,
     ticket_id: TicketId,
     mode: LaunchMode,
+    /// The status the ticket moves to once the session is launched, or `None`
+    /// to leave it where it is. Defaults to the board's "in progress" option.
+    target_status: Option<SharedString>,
+    /// Kept so a successful launch can write [`Self::target_status`] to Notion
+    /// through the workspace's action handler.
+    workspace: WeakEntity<Workspace>,
     fs: Arc<dyn Fs>,
     focus_handle: FocusHandle,
     repositories: Vec<TicketRepository>,
@@ -153,19 +177,22 @@ impl TicketLaunchModal {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        let workspace_handle = cx.weak_entity();
         workspace.toggle_modal(window, cx, move |window, cx| {
-            Self::new(ticket, mode, fs, window, cx)
+            Self::new(ticket, mode, workspace_handle, fs, window, cx)
         });
     }
 
     fn new(
         ticket: TicketRef,
         mode: LaunchMode,
+        workspace: WeakEntity<Workspace>,
         fs: Arc<dyn Fs>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let ticket_id = TicketId::new(ticket.page_id.clone());
+        let target_status = default_target_status(&ticket.status, cx);
         let repositories = repository_registry::registered_repositories(cx);
         let selected_repository = (!repositories.is_empty()).then_some(0);
 
@@ -189,6 +216,8 @@ impl TicketLaunchModal {
             ticket,
             ticket_id,
             mode,
+            target_status,
+            workspace,
             fs,
             focus_handle: cx.focus_handle(),
             repositories,
@@ -548,7 +577,12 @@ impl TicketLaunchModal {
             this.update(cx, |this, cx| {
                 this.launching = false;
                 match result {
-                    Ok(()) => cx.emit(DismissEvent),
+                    // Only once the session is actually running: a ticket
+                    // whose worktree failed to be cut has not been started.
+                    Ok(()) => {
+                        this.apply_target_status(cx);
+                        cx.emit(DismissEvent)
+                    }
                     Err(error) => {
                         this.error = Some(format!("{error:#}").into());
                         cx.notify();
@@ -583,8 +617,11 @@ impl TicketLaunchModal {
         }
     }
 
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let refreshing = matches!(self.body_state, BodyState::Loading);
+        let status_transition = (!self.ticket.status.is_empty())
+            .then(|| self.render_status_transition(window, cx))
+            .map(IntoElement::into_any_element);
         h_flex()
             .w_full()
             .gap_2()
@@ -605,11 +642,8 @@ impl TicketLaunchModal {
                                     this.child(Chip::new(issue_id).label_color(Color::Muted))
                                 },
                             )
-                            .when(!self.ticket.status.is_empty(), |this| {
-                                this.child(
-                                    Chip::new(self.ticket.status.clone())
-                                        .label_color(Color::Accent),
-                                )
+                            .when_some(status_transition, |this, transition| {
+                                this.child(transition)
                             }),
                     ),
             )
@@ -621,6 +655,91 @@ impl TicketLaunchModal {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.load_body(true, window, cx);
                     })),
+            )
+    }
+
+    /// Writes the picked target status to Notion, through the workspace's
+    /// action handler so a failure surfaces as a notification — the modal is
+    /// already dismissing and has nowhere left to show one.
+    fn apply_target_status(&mut self, cx: &mut Context<Self>) {
+        let Some(status) = self.target_status.clone() else {
+            return;
+        };
+        if status == self.ticket.status {
+            return;
+        }
+        let action = agent_ui::SetTicketStatus {
+            ticket_id: self.ticket_id.0.to_string(),
+            status: status.to_string(),
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::set_ticket_status(workspace, &action, cx);
+            })
+            .ok();
+    }
+
+    /// The ticket's current status, and the one launching will move it to.
+    ///
+    /// Rendered as `before → after` with the second half a picker, so the
+    /// automatic move to "in progress" is visible up front and overridable
+    /// (including to "Keep as is") without leaving the modal.
+    fn render_status_transition(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let options = TicketSyncSettings::get_global(cx).notion_status_filter.clone();
+        let current = self.ticket.status.clone();
+        let this = cx.entity().downgrade();
+        let target_label = self
+            .target_status
+            .clone()
+            .unwrap_or_else(|| SharedString::from("Keep as is"));
+
+        h_flex()
+            .gap_1()
+            .child(Chip::new(current.clone()).label_color(Color::Accent))
+            .child(
+                Icon::new(IconName::ArrowRight)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                DropdownMenu::new(
+                    "ticket-launch-target-status",
+                    target_label,
+                    ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                        {
+                            let this = this.clone();
+                            menu = menu.entry("Keep as is", None, move |_window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.target_status = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            });
+                        }
+                        menu = menu.separator();
+                        for option in &options {
+                            if *option == current {
+                                continue;
+                            }
+                            let this = this.clone();
+                            let option = SharedString::from(option.clone());
+                            menu = menu.entry(option.clone(), None, move |_window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.target_status = Some(option.clone());
+                                    cx.notify();
+                                })
+                                .ok();
+                            });
+                        }
+                        menu
+                    }),
+                )
+                .style(DropdownStyle::Ghost)
+                .trigger_size(ButtonSize::Compact),
             )
     }
 
@@ -916,7 +1035,7 @@ impl Render for TicketLaunchModal {
             .w(px(520.))
             .p(DynamicSpacing::Base12.rems(cx))
             .gap_3()
-            .child(self.render_header(cx))
+            .child(self.render_header(window, cx))
             .when(creating_worktree, |this| {
                 this.child(self.render_repository_picker(window, cx))
                     .child(self.render_worktree_picker(window, cx))

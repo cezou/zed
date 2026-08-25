@@ -76,9 +76,10 @@ Stage artifacts under `$HOME` in WSL, not `/tmp`: the distribution is shut down 
 between winrun invocations, and `/tmp` does not survive it.
 
 Measured on this setup: a full `release-fast` build takes 11m30 and its stripped binary is 580 MB;
-the dev profile builds incrementally in about 2 minutes but produces 1.1 GB that takes 38 seconds to
-pull — and cannot be run here at all (see the traps). The incremental `release-fast` time is not
-measured yet. Either way `--pull` is md5-identical either side.
+an incremental one takes about 8 minutes. The dev profile builds incrementally in about 2 minutes but
+produces 1.1 GB that takes 38 seconds to pull — and cannot be run here at all (see the traps). So the
+loop costs roughly 8 minutes of build plus half a minute of transfer per iteration; batch several
+edits into one build rather than one per change. `--pull` is md5-identical either side.
 
 Never `[profile.release]` for iteration: it carries `lto = "thin"` and `codegen-units = 1`, which is
 minutes per iteration for no benefit while testing behaviour. Keep it for actual releases.

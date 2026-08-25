@@ -95,10 +95,64 @@ pub(crate) fn compose_terminal_thread_title(
     }
 }
 
-pub(crate) fn terminal_title_without_prefix(title: &str) -> &str {
+pub fn terminal_title_without_prefix(title: &str) -> &str {
     terminal_title_prefix(title)
         .map(|prefix| &title[prefix.len()..])
         .unwrap_or(title)
+}
+
+/// What the `claude` CLI is doing right now, decoded from the terminal title.
+///
+/// Claude Code reports its own state through the terminal title, as
+/// `ESC ] 0 ; <glyph> <task summary> BEL`: while it works the glyph cycles
+/// through the quadrant-circle spinner frames (`◐ ◑ ◒ ◓`) roughly twice a
+/// second, and once it stops it settles on the asterisk family (`✳ ✻ ✽ ✶`).
+/// That is the only liveness signal available for a CLI running inside a pty —
+/// the terminal itself stays open either way, which is why "the terminal
+/// exists" cannot stand in for "the agent is working".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClaudeActivity {
+    /// The title carries no glyph Claude Code is known to use, so the terminal
+    /// is running something else (a plain shell, a build, ...).
+    #[default]
+    Unknown,
+    Working,
+    Idle,
+}
+
+/// The spinner frames Claude Code animates while a turn is in flight.
+const CLAUDE_WORKING_GLYPHS: [char; 4] = ['\u{25d0}', '\u{25d1}', '\u{25d2}', '\u{25d3}'];
+/// The resting glyphs Claude Code settles on between turns.
+const CLAUDE_IDLE_GLYPHS: [char; 4] = ['\u{2733}', '\u{273b}', '\u{273d}', '\u{2736}'];
+
+/// The title Claude Code shows before the first prompt of a session, which is
+/// a placeholder rather than a task summary.
+const CLAUDE_PLACEHOLDER_TASK: &str = "Claude Code";
+
+pub fn claude_activity(terminal_title: &str) -> ClaudeActivity {
+    let Some(glyph) = terminal_title_prefix(terminal_title)
+        .and_then(|prefix| prefix.trim_end().chars().next_back())
+    else {
+        return ClaudeActivity::Unknown;
+    };
+
+    if CLAUDE_WORKING_GLYPHS.contains(&glyph) {
+        ClaudeActivity::Working
+    } else if CLAUDE_IDLE_GLYPHS.contains(&glyph) {
+        ClaudeActivity::Idle
+    } else {
+        ClaudeActivity::Unknown
+    }
+}
+
+/// The task summary Claude Code appended to its status glyph, with the
+/// pre-first-prompt placeholder treated as "no task yet".
+pub fn claude_task_summary(terminal_title: &str) -> Option<&str> {
+    if claude_activity(terminal_title) == ClaudeActivity::Unknown {
+        return None;
+    }
+    let summary = terminal_title_without_prefix(terminal_title).trim();
+    (!summary.is_empty() && summary != CLAUDE_PLACEHOLDER_TASK).then_some(summary)
 }
 
 pub fn terminal_title_prefix(title: &str) -> Option<&str> {
@@ -668,6 +722,40 @@ mod tests {
         assert_eq!(terminal_title_prefix(" Thinking"), None);
         assert_eq!(terminal_title_prefix("✳"), None);
         assert_eq!(terminal_title_prefix("v1 Running"), None);
+    }
+
+    #[test]
+    fn test_claude_activity_reads_the_status_glyph() {
+        // The frames Claude Code animates while a turn is in flight, captured
+        // from the titles it writes: `◐ Sleep 20 seconds bash`, then `◑ ...`.
+        for title in ["◐ Sleep 20 seconds bash", "◑ Sleep 20 seconds bash"] {
+            assert_eq!(claude_activity(title), ClaudeActivity::Working, "{title}");
+        }
+        // The same summary, once the turn is over.
+        assert_eq!(
+            claude_activity("✳ Sleep 20 seconds bash"),
+            ClaudeActivity::Idle
+        );
+        assert_eq!(claude_activity("✳ Claude Code"), ClaudeActivity::Idle);
+        // A plain shell, a build, anything that is not Claude Code.
+        assert_eq!(claude_activity("~/src/zed"), ClaudeActivity::Unknown);
+        assert_eq!(claude_activity("zsh"), ClaudeActivity::Unknown);
+        assert_eq!(claude_activity("⠋ Running"), ClaudeActivity::Unknown);
+    }
+
+    #[test]
+    fn test_claude_task_summary_drops_the_glyph_and_the_placeholder() {
+        assert_eq!(
+            claude_task_summary("◐ Prime the availability pool again"),
+            Some("Prime the availability pool again")
+        );
+        assert_eq!(
+            claude_task_summary("✳ Prime the availability pool again"),
+            Some("Prime the availability pool again")
+        );
+        // Before the first prompt of a session there is no task to report.
+        assert_eq!(claude_task_summary("✳ Claude Code"), None);
+        assert_eq!(claude_task_summary("zsh"), None);
     }
 
     #[test]

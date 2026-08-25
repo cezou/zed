@@ -39,8 +39,8 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
-    terminal_title_without_prefix,
+    ClaudeActivity, TerminalThreadMetadata, TerminalThreadMetadataStore, claude_activity,
+    claude_task_summary, compose_terminal_thread_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::ticket_metadata_store::{
@@ -295,6 +295,11 @@ pub struct AgentPanelTerminalInfo {
     pub has_notification: bool,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
+    /// What the `claude` CLI running in this terminal is doing, and since when.
+    pub claude_activity: ClaudeActivity,
+    pub claude_activity_since: DateTime<Utc>,
+    /// Claude Code's own summary of the turn it is working on, or last worked on.
+    pub claude_task: Option<SharedString>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1116,6 +1121,14 @@ struct AgentTerminal {
     /// The `claude` CLI session id this terminal is running, if it was
     /// launched via the ticket panel.
     cc_session_id: Option<String>,
+    /// Claude Code's last decoded state. Tracked here rather than derived at
+    /// render time because the UI needs the instant it last changed, and the
+    /// title only ever carries the current frame.
+    claude_activity: ClaudeActivity,
+    claude_activity_since: DateTime<Utc>,
+    /// The task summary Claude Code last reported, kept across the frames
+    /// where the title momentarily carries no summary at all.
+    claude_task: Option<SharedString>,
 }
 
 impl AgentTerminal {
@@ -1172,15 +1185,44 @@ impl AgentTerminal {
         }
 
         let title = self.title(cx);
-        let changed = self.last_known_title != title.as_ref();
-        if changed {
-            self.last_known_title = title.to_string();
+        // Claude Code animates a spinner glyph in the terminal title about
+        // twice a second. Reporting every frame as a title change would
+        // rewrite the persisted row and rebuild the sidebar at that rate, so a
+        // change confined to the status glyph is not a title change here;
+        // `refresh_claude_activity` reports the transitions that matter.
+        let only_status_glyph_moved = terminal_title_without_prefix(&self.last_known_title)
+            == terminal_title_without_prefix(title.as_ref())
+            && claude_activity(&self.last_known_title) != ClaudeActivity::Unknown
+            && claude_activity(title.as_ref()) != ClaudeActivity::Unknown;
+        let changed = !only_status_glyph_moved && self.last_known_title != title.as_ref();
+        self.last_known_title = title.to_string();
+        changed
+    }
+
+    /// Decodes Claude Code's state out of the terminal title, stamping the
+    /// instant of every transition so the UI can show how long the current
+    /// turn has been running.
+    fn refresh_claude_activity(&mut self, cx: &App) -> bool {
+        let title = self.terminal_title(cx);
+        let activity = claude_activity(title.as_ref());
+        let task = claude_task_summary(title.as_ref()).map(SharedString::from);
+
+        let mut changed = false;
+        if self.claude_activity != activity {
+            self.claude_activity = activity;
+            self.claude_activity_since = Utc::now();
+            changed = true;
+        }
+        if task.is_some() && self.claude_task != task {
+            self.claude_task = task;
+            changed = true;
         }
         changed
     }
 
     fn refresh_metadata(&mut self, cx: &mut App) -> bool {
         let title_changed = self.refresh_title(cx);
+        let activity_changed = self.refresh_claude_activity(cx);
         let current_working_directory = self.view.read(cx).terminal().read(cx).working_directory();
         let working_directory_changed = current_working_directory
             .as_ref()
@@ -1188,7 +1230,7 @@ impl AgentTerminal {
         if working_directory_changed {
             self.working_directory = current_working_directory;
         }
-        title_changed || working_directory_changed
+        title_changed || working_directory_changed || activity_changed
     }
 
     fn custom_title(&self, cx: &App) -> Option<SharedString> {
@@ -2343,6 +2385,9 @@ impl AgentPanel {
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
+            claude_activity: ClaudeActivity::default(),
+            claude_activity_since: Utc::now(),
+            claude_task: None,
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
@@ -2393,7 +2438,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_terminal_internal(terminal_id, true, window, cx);
+        self.close_terminal_internal(terminal_id, true, true, window, cx);
     }
 
     pub fn close_terminal_without_activating_draft(
@@ -2402,13 +2447,28 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_terminal_internal(terminal_id, false, window, cx);
+        self.close_terminal_internal(terminal_id, false, true, window, cx);
+    }
+
+    /// Drops the live terminal but keeps its persisted row, so the entry stays
+    /// in the sidebar and can be respawned later. Used when the process inside
+    /// the terminal exited on its own: a `claude` session that has been quit is
+    /// still resumable by session id, and deleting the row would throw that
+    /// away for good.
+    pub fn detach_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_terminal_internal(terminal_id, true, false, window, cx);
     }
 
     fn close_terminal_internal(
         &mut self,
         terminal_id: TerminalId,
         activate_draft_after_close: bool,
+        delete_metadata: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2421,7 +2481,9 @@ impl AgentPanel {
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
-        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+        if delete_metadata
+            && let Some(store) = TerminalThreadMetadataStore::try_global(cx)
+        {
             store.update(cx, |store, cx| {
                 store.delete(terminal_id, cx);
             });
@@ -3541,6 +3603,9 @@ impl AgentPanel {
                 has_notification: terminal.has_notification,
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
+                claude_activity: terminal.claude_activity,
+                claude_activity_since: terminal.claude_activity_since,
+                claude_task: terminal.claude_task.clone(),
             })
             .collect()
     }

@@ -6,12 +6,23 @@ use crate::{
 use gpui::{ClickEvent, Hsla, MouseButton, SharedString, WindowBackgroundAppearance};
 use std::sync::Arc;
 
-/// How many agent sessions a ticket has, and whether any of them are still live.
+/// How many agent sessions a ticket has, and what the agents in them are doing.
+///
+/// The distinction that matters is `Running` versus `Finished`: an open
+/// terminal is not a working agent, so liveness alone would leave every
+/// launched ticket spinning forever.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TicketSessionState {
     #[default]
     NeverLaunched,
+    /// Sessions exist but no agent is working in them, and none reported
+    /// finishing a turn either (their terminals are closed, or the agent never
+    /// got started).
     Idle {
+        total: usize,
+    },
+    /// No agent is working, but at least one finished a turn and is waiting.
+    Finished {
         total: usize,
     },
     Running {
@@ -203,10 +214,13 @@ impl RenderOnce for TicketItem {
             .title_bar_background
             .blend(color.panel_background.opacity(0.25));
         let raw_bg = self.base_bg.unwrap_or(sidebar_base_bg);
-        let running = matches!(self.session_state, TicketSessionState::Running { .. });
+        let highlighted = matches!(
+            self.session_state,
+            TicketSessionState::Running { .. } | TicketSessionState::Finished { .. }
+        );
         let apparent_bg = {
             let bg = color.background.blend(raw_bg);
-            if running {
+            if highlighted {
                 bg.blend(cx.theme().status().success.opacity(0.08))
             } else {
                 bg
@@ -262,6 +276,10 @@ impl RenderOnce for TicketItem {
                 .size(IconSize::Small)
                 .color(Color::Accent)
                 .into_any_element(),
+            TicketSessionState::Finished { .. } => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
             TicketSessionState::Idle { .. } => Icon::new(IconName::Terminal)
                 .size(IconSize::Small)
                 .color(Color::Muted)
@@ -276,6 +294,10 @@ impl RenderOnce for TicketItem {
             TicketSessionState::NeverLaunched => "No agent session yet".into(),
             TicketSessionState::Idle { total: 1 } => "1 session".into(),
             TicketSessionState::Idle { total } => format!("{total} sessions").into(),
+            TicketSessionState::Finished { total: 1 } => "Agent finished".into(),
+            TicketSessionState::Finished { total } => {
+                format!("Agent finished · {total} sessions").into()
+            }
             TicketSessionState::Running { live, total } => {
                 format!("{live} of {total} sessions running").into()
             }
@@ -497,6 +519,20 @@ impl Component for TicketItem {
                             .expanded(true)
                             .worktree_label("ct-1500-pricing-refactor")
                             .timestamp("3m"),
+                    )
+                    .into_any_element(),
+            ),
+            single_example(
+                "Finished (waiting for you)",
+                container()
+                    .child(
+                        TicketItem::new("tk-3b", "Prime the availability pool again")
+                            .issue_id("CT-1501")
+                            .status("In Progress")
+                            .session_state(TicketSessionState::Finished { total: 1 })
+                            .expandable(true)
+                            .worktree_label("ct-1501-availability-pool")
+                            .timestamp("1m"),
                     )
                     .into_any_element(),
             ),

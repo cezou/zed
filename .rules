@@ -137,9 +137,10 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 ## Running Zed in dev mode
 
-- `cargo build -p zed && ./target/debug/zed` (or `cargo run -p zed`).
+- Build it with the `remote-build` skill and the **`release-fast`** profile, not `dev`: only a release profile turns `debug_assertions` off, and that is what makes `rust-embed` embed the assets rather than read them off disk at the build machine's path. A dev binary cannot be moved between machines.
 - App logs go to `~/.local/share/zed/logs/Zed.log`, not stdout/stderr — check there for `log::info!`/`log::error!` output, not the terminal.
-- Under WSL/remote X11 sandboxes with broken GPU passthrough (window renders solid black, stderr shows `DRI3 error`), force X11 instead of Wayland: `env -u WAYLAND_DISPLAY DISPLAY=:0 ./target/debug/zed`.
+- The channel is `dev` (`crates/zed/RELEASE_CHANNEL`), so the single-instance check is skipped and each launch is a *new* process on the same `db/0-dev` SQLite. Close the running one first, matching its exact name (`pkill -x <binary>`), or the two clobber each other's state.
+- Under WSL/remote X11 sandboxes with broken GPU passthrough (window renders solid black, stderr shows `DRI3 error`), force X11 instead of Wayland: `env -u WAYLAND_DISPLAY DISPLAY=:0 <binary>`.
 - If it then blocks on an "Unsupported GPU" dialog (software-emulated GPU detected), set `ZED_ALLOW_EMULATED_GPU=1` to skip it.
 
 ## Agent-driven UI testing (screenshots, clicking)

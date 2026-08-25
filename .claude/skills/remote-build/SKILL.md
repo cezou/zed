@@ -75,12 +75,13 @@ other build lying around.
 Stage artifacts under `$HOME` in WSL, not `/tmp`: the distribution is shut down and restarted
 between winrun invocations, and `/tmp` does not survive it.
 
-Measured on this setup: an incremental `cargo build -p zed` takes about 2 minutes, the stripped dev
-binary is 1.1 GB, and pulling it takes 38 seconds — md5 identical either side.
+Measured on this setup: a full `release-fast` build takes 11m30 and its stripped binary is 580 MB;
+the dev profile builds incrementally in about 2 minutes but produces 1.1 GB that takes 38 seconds to
+pull — and cannot be run here at all (see the traps). The incremental `release-fast` time is not
+measured yet. Either way `--pull` is md5-identical either side.
 
-Build with the **dev** profile for iteration. `[profile.release]` carries `lto = "thin"` and
-`codegen-units = 1`, which is minutes per iteration for no benefit while testing behaviour; keep it
-for actual releases.
+Never `[profile.release]` for iteration: it carries `lto = "thin"` and `codegen-units = 1`, which is
+minutes per iteration for no benefit while testing behaviour. Keep it for actual releases.
 
 `--pull` is binary-safe. It has to be: PowerShell re-encodes what native commands write to stdout,
 so piping a binary through `wsl -e cat` corrupts it. The file is staged onto the Windows filesystem

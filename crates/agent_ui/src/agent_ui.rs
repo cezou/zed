@@ -359,6 +359,22 @@ pub struct StartTicketWork {
     pub additional_session: bool,
 }
 
+/// Moves a Notion ticket to another status option.
+///
+/// Dispatched as an action for the same reason as [`StartTicketWork`]: the
+/// sidebar renders the status picker but the Notion write lives in the
+/// `ticket_sync` crate.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = tickets)]
+#[serde(deny_unknown_fields)]
+pub struct SetTicketStatus {
+    /// The ticket's Notion page id, as stored in the ticket metadata store.
+    pub ticket_id: String,
+    /// The exact status option string as it appears in the Notion schema,
+    /// emoji and numbering included.
+    pub status: String,
+}
+
 /// Action to authorize a tool call with a specific permission option.
 /// This is used by the permission granularity dropdown to authorize tool calls.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]

@@ -156,6 +156,9 @@ pub struct TicketMetadataStore {
     /// deciding whether a terminal row belongs to a ticket) doesn't have to
     /// scan every ticket's sessions on every rebuild.
     sessions_by_terminal: HashMap<TerminalId, TicketId>,
+    /// The board's tracked status options, refreshed from the settings by the
+    /// sync service. Not persisted: it is derived configuration, not state.
+    status_options: Vec<SharedString>,
     pending_ops_tx: async_channel::Sender<DbOperation>,
     _db_operations_task: Task<()>,
 }
@@ -326,6 +329,48 @@ impl TicketMetadataStore {
             }
         };
         self.save_worktree_record(record, cx);
+    }
+
+    /// Overwrites a ticket's status locally, so the sidebar reflects a status
+    /// change immediately instead of waiting for the next board poll. The
+    /// caller is responsible for writing the same value to Notion, and for
+    /// calling this again with the previous value if that write fails.
+    pub fn set_status(
+        &mut self,
+        ticket_id: &TicketId,
+        status: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let Some(existing) = self.tickets.get(ticket_id) else {
+            anyhow::bail!("cannot set the status of an unknown ticket {ticket_id:?}");
+        };
+        if existing.status == status {
+            return Ok(());
+        }
+        let record = TicketWorktreeRecord {
+            status,
+            ..existing.clone()
+        };
+        self.save_worktree_record(record, cx);
+        Ok(())
+    }
+
+    /// The status options a ticket can be moved to, in board order.
+    ///
+    /// Lives here rather than in the settings so the sidebar can render a
+    /// status picker without depending on the Notion crates — the same reason
+    /// it dispatches [`crate::SetTicketStatus`] instead of writing to Notion
+    /// itself.
+    pub fn status_options(&self) -> &[SharedString] {
+        &self.status_options
+    }
+
+    pub fn set_status_options(&mut self, options: Vec<SharedString>, cx: &mut Context<Self>) {
+        if self.status_options == options {
+            return;
+        }
+        self.status_options = options;
+        cx.notify();
     }
 
     /// Caches the ticket's Notion page body, which is fetched lazily rather
@@ -524,6 +569,7 @@ impl TicketMetadataStore {
             db,
             tickets: HashMap::default(),
             sessions_by_terminal: HashMap::default(),
+            status_options: Vec::new(),
             pending_ops_tx: tx,
             _db_operations_task,
         };

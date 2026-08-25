@@ -106,7 +106,7 @@ gpui::actions!(
     ]
 );
 
-const READY_FOR_DEV_SECTION_LABEL: &str = "Ready for Dev";
+const NO_SESSIONS_SECTION_LABEL: &str = "No sessions";
 
 const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
@@ -416,7 +416,7 @@ enum TicketSectionKey {
         host: Option<RemoteConnectionOptions>,
     },
     /// Tickets with no worktree yet.
-    ReadyForDev,
+    NoSessions,
 }
 
 impl TicketSectionKey {
@@ -431,7 +431,7 @@ impl TicketSectionKey {
                     .map(|host| format!("{:?}", remote_connection_identity(host)))
                     .unwrap_or_default(),
             ),
-            TicketSectionKey::ReadyForDev => (PathBuf::new(), String::new()),
+            TicketSectionKey::NoSessions => (PathBuf::new(), String::new()),
         }
     }
 }
@@ -2222,14 +2222,14 @@ impl Sidebar {
                         TicketSectionKey::Repo { root, .. } => {
                             SharedString::from(project::path_suffix(root, 0))
                         }
-                        TicketSectionKey::ReadyForDev => READY_FOR_DEV_SECTION_LABEL.into(),
+                        TicketSectionKey::NoSessions => NO_SESSIONS_SECTION_LABEL.into(),
                     };
                     (key, label, tickets)
                 })
                 .collect();
         ticket_sections.push((
-            TicketSectionKey::ReadyForDev,
-            READY_FOR_DEV_SECTION_LABEL.into(),
+            TicketSectionKey::NoSessions,
+            NO_SESSIONS_SECTION_LABEL.into(),
             mem::take(&mut ticket_buckets.ready_for_dev),
         ));
 
@@ -8157,7 +8157,7 @@ impl Sidebar {
 
     /// Buckets every ticket in the store into the project group whose repo it
     /// was branched from, a section for repos that are not open in this window,
-    /// or the "Ready for Dev" section for tickets with no worktree yet.
+    /// or the "No sessions" section for tickets with no worktree yet.
     fn collect_ticket_entries(
         &self,
         groups: &[workspace::ProjectGroup],
@@ -8251,7 +8251,7 @@ impl Sidebar {
                     host: record.remote_connection.clone(),
                 })
             } else {
-                Some(TicketSectionKey::ReadyForDev)
+                Some(TicketSectionKey::NoSessions)
             };
 
             // Sessions of a ticket in an unopened repo still need a group key to
@@ -8376,7 +8376,7 @@ impl Sidebar {
                 (Some(group_key), _) => {
                     buckets.by_group.entry(group_key).or_default().push(entry);
                 }
-                (None, Some(TicketSectionKey::ReadyForDev)) => {
+                (None, Some(TicketSectionKey::NoSessions)) => {
                     buckets.ready_for_dev.push(entry);
                 }
                 (None, Some(section_key)) => {
@@ -8613,7 +8613,43 @@ impl Sidebar {
         .when_some(record.issue_id.clone(), |this, issue_id| {
             this.issue_id(issue_id)
         })
-        .when_some(record.status.clone(), |this, status| this.status(status))
+        .when_some(record.status.clone(), |this, status| {
+            let this = this.status(status.clone());
+            let Some(store) = TicketMetadataStore::try_global(cx) else {
+                return this;
+            };
+            let options = store.read(cx).status_options().to_vec();
+            if options.is_empty() {
+                return this;
+            }
+            let ticket_id = record.ticket_id.clone();
+            this.status_menu(
+                SharedString::from(format!("ticket-status-{ix}")),
+                move |window, cx| {
+                    let ticket_id = ticket_id.clone();
+                    let current = status.clone();
+                    let options = options.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                        for option in &options {
+                            let action = agent_ui::SetTicketStatus {
+                                ticket_id: ticket_id.0.to_string(),
+                                status: option.to_string(),
+                            };
+                            menu = menu.toggleable_entry(
+                                option.clone(),
+                                *option == current,
+                                IconPosition::End,
+                                None,
+                                move |window, cx| {
+                                    window.dispatch_action(action.boxed_clone(), cx);
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                },
+            )
+        })
         .when_some(record.ticket_type.clone(), |this, ticket_type| {
             this.ticket_type(ticket_type)
         })
@@ -8780,7 +8816,7 @@ impl Sidebar {
 
         let hint = match &header.key {
             TicketSectionKey::Repo { .. } => Some("not open"),
-            TicketSectionKey::ReadyForDev => None,
+            TicketSectionKey::NoSessions => None,
         };
 
         h_flex()

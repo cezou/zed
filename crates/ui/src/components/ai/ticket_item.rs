@@ -1,9 +1,12 @@
 use crate::{
-    Chip, CommonAnimationExt, Disclosure, GradientFade, HighlightedLabel, IconButtonShape, Tooltip,
-    prelude::*,
+    ButtonLike, Chip, CommonAnimationExt, ContextMenu, Disclosure, GradientFade, HighlightedLabel,
+    IconButtonShape, PopoverMenu, Tooltip, prelude::*,
 };
 
-use gpui::{ClickEvent, Hsla, MouseButton, SharedString, WindowBackgroundAppearance};
+use gpui::{
+    Anchor, ClickEvent, Entity, Hsla, MouseButton, SharedString, WindowBackgroundAppearance,
+};
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// How many agent sessions a ticket has, and what the agents in them are doing.
@@ -66,6 +69,10 @@ pub struct TicketItem {
     notified: bool,
     base_bg: Option<Hsla>,
     action_slot: Option<AnyElement>,
+    status_menu: Option<(
+        ElementId,
+        Rc<dyn Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>>>,
+    )>,
     on_toggle: Option<Arc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
@@ -91,6 +98,7 @@ impl TicketItem {
             notified: false,
             base_bg: None,
             action_slot: None,
+            status_menu: None,
             on_toggle: None,
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
@@ -172,6 +180,24 @@ impl TicketItem {
 
     pub fn action_slot(mut self, slot: impl IntoElement) -> Self {
         self.action_slot = Some(slot.into_any_element());
+        self
+    }
+
+    /// Turns the status chip into a dropdown that opens `builder`'s menu, so a
+    /// ticket's status can be changed from the row itself.
+    ///
+    /// The menu is built lazily rather than passed as an already-created
+    /// [`ContextMenu`] entity: every visible row renders this component, and
+    /// eagerly building one entity per row per frame would be wasted work for
+    /// the rows nobody clicks.
+    ///
+    /// `id` must be distinct from the row's own id — they share an element tree.
+    pub fn status_menu(
+        mut self,
+        id: impl Into<ElementId>,
+        builder: impl Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>> + 'static,
+    ) -> Self {
+        self.status_menu = Some((id.into(), Rc::new(builder)));
         self
     }
 
@@ -346,11 +372,26 @@ impl RenderOnce for TicketItem {
             })
             .when_some(self.status, |this, status| {
                 let status_color = ticket_status_color(&status);
-                this.child(
-                    Chip::new(status)
-                        .label_color(status_color)
-                        .label_size(LabelSize::XSmall),
-                )
+                let chip = Chip::new(status)
+                    .label_color(status_color)
+                    .label_size(LabelSize::XSmall);
+                match self.status_menu {
+                    // Anchored below the chip rather than at the cursor so the
+                    // menu doesn't cover the row that was just clicked.
+                    Some((menu_id, builder)) => this.child(
+                        PopoverMenu::new(menu_id)
+                            .trigger(
+                                ButtonLike::new("ticket-status-trigger")
+                                    .style(ButtonStyle::Transparent)
+                                    .size(ButtonSize::None)
+                                    .child(chip),
+                            )
+                            .menu(move |window, cx| builder(window, cx))
+                            .anchor(Anchor::TopLeft)
+                            .attach(Anchor::BottomLeft),
+                    ),
+                    None => this.child(chip),
+                }
             })
             .when_some(self.ticket_type, |this, ticket_type| {
                 this.child(

@@ -15,6 +15,7 @@ use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
     fuzzy_match_positions,
 };
+use agent_ui::terminal_thread_metadata_store::ClaudeActivity;
 use agent_ui::ticket_metadata_store::{TicketId, TicketMetadataStore, TicketWorktreeRecord};
 use agent_ui::{
     AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo,
@@ -55,6 +56,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
@@ -450,9 +452,52 @@ struct TicketSessionEntry {
     metadata: TerminalThreadMetadata,
     workspace: ThreadEntryWorkspace,
     is_live: bool,
+    /// What the `claude` CLI in this session is doing. A session whose terminal
+    /// is gone is reported as [`ClaudeActivity::Idle`] rather than carrying the
+    /// state it had when it was last seen.
+    activity: ClaudeActivity,
+    /// When `activity` last changed, i.e. when the current turn started.
+    activity_since: DateTime<Utc>,
+    /// Claude Code's own summary of that turn, which is what the row is titled
+    /// with — the terminal's name says nothing about what the agent is doing.
+    task: Option<SharedString>,
     last_active_at: DateTime<Utc>,
     has_notification: bool,
     highlight_positions: Vec<usize>,
+}
+
+impl TicketSessionEntry {
+    /// True when the agent in this session has just stopped working and is
+    /// waiting on the user. A session whose terminal is gone does not count:
+    /// every ticket ever launched would otherwise read as freshly finished.
+    fn has_finished(&self) -> bool {
+        self.is_live && self.activity == ClaudeActivity::Idle && self.task.is_some()
+    }
+
+    /// The title for this row: what the agent is working on, never the name of
+    /// the terminal it happens to be running in.
+    fn display_task(&self) -> SharedString {
+        self.task.clone().unwrap_or_else(|| {
+            if self.activity == ClaudeActivity::Working {
+                "Working…".into()
+            } else {
+                "Claude Code".into()
+            }
+        })
+    }
+}
+
+/// How long the current turn has been running, in the shape Claude Code itself
+/// uses in its status line (`12s`, `1m57s`, `1h04m`).
+fn format_elapsed(elapsed: chrono::Duration) -> String {
+    let seconds = elapsed.num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
+    }
 }
 
 #[derive(Clone)]
@@ -908,6 +953,8 @@ pub struct Sidebar {
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
+    /// Redraw timer kept alive only while some row shows a running clock.
+    elapsed_ticker_task: Option<Task<()>>,
     /// For the thread import banners, if there is just one we show "Import
     /// Threads" but if we are showing both the external agents and other
     /// channels import banners then we change the text to disambiguate the
@@ -1063,6 +1110,7 @@ impl Sidebar {
             cross_channel_import_channels: Vec::new(),
             expanded_tickets: HashSet::new(),
             collapsed_ticket_sections: HashSet::new(),
+            elapsed_ticker_task: None,
         }
     }
 
@@ -1249,7 +1297,17 @@ impl Sidebar {
                     this.schedule_update_entries(false, cx);
                 }
                 AgentPanelEvent::TerminalCloseRequested { metadata } => {
-                    if let Some(workspace) = workspace.upgrade() {
+                    // A `claude` session that has exited is still resumable by
+                    // session id, so the process ending is not the user
+                    // discarding the session: keep the row (and its worktree)
+                    // and let the terminal be respawned on the next click.
+                    if metadata.cc_session_id.is_some() {
+                        let terminal_id = metadata.terminal_id;
+                        agent_panel.update(cx, |panel, cx| {
+                            panel.detach_terminal(terminal_id, window, cx);
+                        });
+                        this.schedule_update_entries(false, cx);
+                    } else if let Some(workspace) = workspace.upgrade() {
                         let workspace = ThreadEntryWorkspace::Open(workspace);
                         this.close_terminal(metadata, &workspace, window, cx);
                     }
@@ -2271,6 +2329,7 @@ impl Sidebar {
         self.apply_list_state_diff(&previous_shapes, multi_workspace.read(cx));
 
         self.prefetch_worktree_default_branches(cx);
+        self.refresh_elapsed_ticker(cx);
 
         if had_notifications != self.has_notifications(cx) {
             multi_workspace.update(cx, |_, cx| {
@@ -2279,6 +2338,38 @@ impl Sidebar {
         }
 
         cx.notify();
+    }
+
+    /// Redraws the list once a second while a row shows a running clock, and
+    /// parks the timer as soon as none does. The clock is derived at render
+    /// time from the entry's transition instant, so a bare `notify` is enough
+    /// — the entries themselves do not have to be rebuilt.
+    fn refresh_elapsed_ticker(&mut self, cx: &mut Context<Self>) {
+        let needs_ticker = self.contents.entries.iter().any(|entry| match entry {
+            ListEntry::TicketSession(session) => {
+                session.activity == ClaudeActivity::Working || session.has_finished()
+            }
+            _ => false,
+        });
+
+        if !needs_ticker {
+            self.elapsed_ticker_task = None;
+            return;
+        }
+        if self.elapsed_ticker_task.is_some() {
+            return;
+        }
+
+        self.elapsed_ticker_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        }));
     }
 
     /// Splices only the changed entry range, leaving unchanged item measurements intact.
@@ -4856,6 +4947,18 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A ticket session whose terminal is gone is about to be respawned with
+        // `claude --resume`, which is the only place the record learns that it
+        // was picked up again.
+        if metadata.cc_session_id.is_some()
+            && let Some(store) = TicketMetadataStore::try_global(cx)
+        {
+            let terminal_id = metadata.terminal_id;
+            store.update(cx, |store, cx| {
+                store.mark_session_resumed(terminal_id, Utc::now(), cx);
+            });
+        }
+
         match workspace {
             ThreadEntryWorkspace::Open(workspace) => {
                 self.activate_terminal_in_workspace(&workspace, metadata, retain, window, cx);
@@ -8176,6 +8279,23 @@ impl Sidebar {
                     });
                 let live = live_terminals.get(&session.terminal_id);
                 let has_notification = live.is_some_and(|terminal| terminal.has_notification);
+                let activity = live
+                    .map(|terminal| terminal.claude_activity)
+                    .unwrap_or(ClaudeActivity::Idle);
+                let activity_since = live
+                    .map(|terminal| terminal.claude_activity_since)
+                    .unwrap_or(session.created_at);
+                // The persisted terminal title is the last title Claude Code
+                // set, so a session restored after a restart still knows what
+                // it was working on.
+                let task = live
+                    .and_then(|terminal| terminal.claude_task.clone())
+                    .or_else(|| {
+                        agent_ui::terminal_thread_metadata_store::claude_task_summary(
+                            metadata.title.as_ref(),
+                        )
+                        .map(SharedString::from)
+                    });
 
                 buckets.session_terminal_ids.insert(session.terminal_id);
                 if has_notification {
@@ -8189,6 +8309,9 @@ impl Sidebar {
                     metadata,
                     workspace,
                     is_live: live.is_some(),
+                    activity,
+                    activity_since,
+                    task,
                     last_active_at: session.last_resumed_at.unwrap_or(session.created_at),
                     has_notification,
                     highlight_positions: Vec::new(),
@@ -8201,14 +8324,25 @@ impl Sidebar {
                     .then_with(|| left.metadata.terminal_id.cmp(&right.metadata.terminal_id))
             });
 
-            let live_count = sessions.iter().filter(|session| session.is_live).count();
-            let session_state = if live_count > 0 {
+            // Liveness deliberately plays no part here: an open terminal is not
+            // a working agent, and keying the spinner off it left every
+            // launched ticket spinning for as long as the terminal stayed open.
+            let working_count = sessions
+                .iter()
+                .filter(|session| session.activity == ClaudeActivity::Working)
+                .count();
+            let finished = sessions.iter().any(|session| session.has_finished());
+            let session_state = if working_count > 0 {
                 TicketSessionState::Running {
-                    live: live_count,
+                    live: working_count,
                     total: sessions.len(),
                 }
             } else if sessions.is_empty() {
                 TicketSessionState::NeverLaunched
+            } else if finished {
+                TicketSessionState::Finished {
+                    total: sessions.len(),
+                }
             } else {
                 TicketSessionState::Idle {
                     total: sessions.len(),
@@ -8284,7 +8418,7 @@ impl Sidebar {
 
             let mut session_matched = false;
             for session in &mut ticket.sessions {
-                let title = session.metadata.display_title();
+                let title = session.display_task();
                 match fuzzy_match_positions(query, title.as_ref()) {
                     Some(positions) => {
                         session.highlight_positions = positions;
@@ -8513,18 +8647,22 @@ impl Sidebar {
         let sidebar_bg = color
             .title_bar_background
             .blend(color.panel_background.opacity(0.25));
-        let timestamp = format_history_entry_timestamp(session.last_active_at);
         let focus_handle = self.focus_handle.clone();
         let is_remote = session.workspace.is_remote(cx);
 
-        let display_title = session.metadata.display_title();
-        let (icon_char, title, highlight_positions) =
-            match split_leading_icon_char(&display_title, &session.highlight_positions) {
-                Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
-                None => (None, display_title, session.highlight_positions.clone()),
-            };
+        let is_working = session.activity == ClaudeActivity::Working;
+        let has_finished = session.has_finished();
+        let title = session.display_task();
 
-        let status = if session.is_live {
+        // While a turn is in flight the elapsed time is what the row is really
+        // reporting; once it is over, how long ago it ended.
+        let timestamp: SharedString = if is_working || has_finished {
+            format_elapsed(Utc::now() - session.activity_since).into()
+        } else {
+            format_history_entry_timestamp(session.last_active_at).into()
+        };
+
+        let status = if is_working {
             AgentThreadStatus::Running
         } else {
             AgentThreadStatus::Completed
@@ -8536,13 +8674,17 @@ impl Sidebar {
             .child(
                 ThreadItem::new(id, title)
                     .base_bg(sidebar_bg)
-                    .icon(IconName::Terminal)
-                    .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+                    .icon(if has_finished {
+                        IconName::Check
+                    } else {
+                        IconName::Terminal
+                    })
+                    .when(has_finished, |this| this.icon_color(Color::Success))
                     .is_remote(is_remote)
                     .status(status)
                     .timestamp(timestamp)
                     .notified(session.has_notification)
-                    .highlight_positions(highlight_positions)
+                    .highlight_positions(session.highlight_positions.clone())
                     .selected(is_active)
                     .focused(is_focused)
                     .hovered(is_hovered)

@@ -8418,13 +8418,20 @@ impl Sidebar {
 
             let mut session_matched = false;
             for session in &mut ticket.sessions {
-                let title = session.display_task();
-                match fuzzy_match_positions(query, title.as_ref()) {
+                // Highlights can only be placed on the text the row shows, but
+                // a session is still findable by the terminal's own name — that
+                // is all there is to go on before Claude reports a task.
+                match fuzzy_match_positions(query, session.display_task().as_ref()) {
                     Some(positions) => {
                         session.highlight_positions = positions;
                         session_matched = true;
                     }
-                    None => session.highlight_positions.clear(),
+                    None => {
+                        session.highlight_positions.clear();
+                        let terminal_title = session.metadata.display_title();
+                        session_matched |=
+                            fuzzy_match_positions(query, terminal_title.as_ref()).is_some();
+                    }
                 }
             }
 
@@ -8432,9 +8439,11 @@ impl Sidebar {
                 continue;
             }
             if !ticket_matched && !container_matched {
-                ticket
-                    .sessions
-                    .retain(|session| !session.highlight_positions.is_empty());
+                ticket.sessions.retain(|session| {
+                    !session.highlight_positions.is_empty()
+                        || fuzzy_match_positions(query, session.metadata.display_title().as_ref())
+                            .is_some()
+                });
             }
             matched.push(ticket);
         }

@@ -10,12 +10,19 @@ at 16 threads. `script/winrun` bridges the two: it pushes the current commit, ch
 out on the Windows machine, runs the command there, and streams the output back with the exit code
 propagated.
 
-Requires `~/.config/zed-winrun.env` (outside the repo, since it holds machine-specific paths):
+Requires `~/.config/zed-winrun.env`. It lives outside the repo on purpose — this is a public fork,
+and the host name and paths belong to the developer's machines, not to the project:
 
 ```sh
 ZED_WIN_HOST=zed-win                    # a Host entry in ~/.ssh/config
-ZED_WIN_REPO='C:\Users\you\src\zed'     # the Zed clone on the Windows machine
+ZED_WIN_REPO='C:\Users\you\src\zed'     # the Windows clone
+ZED_WSL_REPO=/home/you/zed              # the clone inside WSL      (--wsl only)
+ZED_WSL_TARGET=/home/you/zed-target     # CARGO_TARGET_DIR in WSL   (--wsl only)
 ```
+
+The transport is SSH to the Windows machine's OpenSSH Server over Tailscale, key-only, with the
+port opened on the Tailscale interface alone. Setting that up is a one-off; `script/winrun --help`
+restates what the configuration file needs.
 
 ## What to delegate
 

@@ -17061,6 +17061,7 @@ dependencies = [
  "menu",
  "node_runtime",
  "notifications",
+ "notion_client",
  "platform_title_bar",
  "pretty_assertions",
  "project",

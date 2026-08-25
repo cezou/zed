@@ -8563,7 +8563,9 @@ impl Sidebar {
             .map(|at| SharedString::from(format_history_entry_timestamp(at)))
             .unwrap_or_default();
 
-        let url = record.url.clone();
+        // Records stored before the url normalization in `parse_row` landed
+        // still hold the unopenable bare-id form until their next sync.
+        let url = notion_client::normalize_page_url(&record.url);
         let has_worktree = record.worktree_path.is_some();
         let (work_button_id, work_button_icon, work_button_label) = if has_worktree {
             (

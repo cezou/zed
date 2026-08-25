@@ -276,7 +276,7 @@ fn ticket_terminal_spawn(
 /// session. One that was started through Claude's own picker has no id to
 /// resume — Claude alone knows which session was chosen — so it reopens the
 /// picker instead of dropping the user into a bare shell.
-fn terminal_resume_command(metadata: &TerminalThreadMetadata) -> Option<String> {
+pub fn terminal_resume_command(metadata: &TerminalThreadMetadata) -> Option<String> {
     if let Some(cc_session_id) = metadata.cc_session_id.as_ref() {
         return Some(format!("{CLAUDE_RESUME_COMMAND} {cc_session_id}"));
     }

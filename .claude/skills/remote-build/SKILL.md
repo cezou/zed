@@ -75,6 +75,28 @@ and carried by scp over the SFTP subsystem, which never touches a shell.
 
 ## Traps
 
+- **A dev-profile binary is not relocatable, and a symlink will not fix it.** `rust-embed` embeds
+  nothing in a debug build: it reads the assets off disk at runtime, at the absolute path baked in at
+  compile time. A binary built in the WSL clone therefore looks for `$ZED_WSL_REPO/assets` on *this*
+  machine and panics on `settings/default.json` if that path is not there. Make the build path exist
+  here with a **bind mount**:
+
+  ```sh
+  sudo mkdir -p "$ZED_WSL_REPO"
+  sudo mount --bind "$PWD" "$ZED_WSL_REPO"     # add to /etc/fstab to survive a reboot
+  ```
+
+  It has to be a bind mount, not a symlink. The generated `get()` guards against path traversal with
+  `file_path.canonicalize().starts_with(<folder path canonicalized at build time>)`, and
+  `canonicalize` resolves symlinks — so through a symlink the path comes back as the *real* repo path,
+  fails the prefix check, and the lookup returns `None`. Its only fallback accepts a final component
+  that is itself a symlink, which an asset file is not. A bind mount is neither a symlink nor a `..`,
+  so the path stays under `$ZED_WSL_REPO` and the check passes.
+
+  `winrun` checks the same SHA out on both sides, so the assets match. The alternative — enabling
+  `rust-embed`'s `debug-embed` feature — makes the binary self-contained but slows every incremental
+  build, which is why Zed leaves it off.
+
 - **Commit first.** `winrun` refuses to run with a dirty working tree, because the Windows machine
   builds what was pushed — a build of un-pushed edits would be a lie. Commit, then delegate.
 - **The Windows machine ends up on a detached HEAD** at the SHA that was built. That is deliberate:

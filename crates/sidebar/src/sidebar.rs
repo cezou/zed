@@ -1297,11 +1297,14 @@ impl Sidebar {
                     this.schedule_update_entries(false, cx);
                 }
                 AgentPanelEvent::TerminalCloseRequested { metadata } => {
-                    // A `claude` session that has exited is still resumable by
-                    // session id, so the process ending is not the user
-                    // discarding the session: keep the row (and its worktree)
-                    // and let the terminal be respawned on the next click.
-                    if metadata.cc_session_id.is_some() {
+                    // A `claude` session that has exited is still resumable, so
+                    // the process ending is not the user discarding the session:
+                    // keep the row (and its worktree) and let the terminal be
+                    // respawned on the next click. The test is what a respawn
+                    // would actually run, because a session attached to an
+                    // existing worktree is resumed through Claude's own picker
+                    // and so carries no `cc_session_id` of its own.
+                    if agent_ui::terminal_resume_command(metadata).is_some() {
                         let terminal_id = metadata.terminal_id;
                         agent_panel.update(cx, |panel, cx| {
                             panel.detach_terminal(terminal_id, window, cx);
@@ -4950,7 +4953,7 @@ impl Sidebar {
         // A ticket session whose terminal is gone is about to be respawned with
         // `claude --resume`, which is the only place the record learns that it
         // was picked up again.
-        if metadata.cc_session_id.is_some()
+        if agent_ui::terminal_resume_command(&metadata).is_some()
             && let Some(store) = TicketMetadataStore::try_global(cx)
         {
             let terminal_id = metadata.terminal_id;

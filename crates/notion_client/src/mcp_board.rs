@@ -481,8 +481,12 @@ fn parse_row(
     status_property: &str,
     issue_id_property: Option<&str>,
 ) -> Option<TicketRef> {
-    let url = row.get("url").and_then(Value::as_str)?.to_string();
-    let page_id = url.rsplit('/').next().unwrap_or(&url).to_string();
+    let raw_url = row.get("url").and_then(Value::as_str)?;
+    // Derived from the *raw* url: this is the primary key of the on-disk
+    // ticket store (see `TicketRef::notion_page_uuid`), so normalizing the
+    // url must not shift it.
+    let page_id = raw_url.rsplit('/').next().unwrap_or(raw_url).to_string();
+    let url = crate::normalize_page_url(raw_url);
     let title = row
         .get(title_property)
         .and_then(Value::as_str)
@@ -679,6 +683,21 @@ mod tests {
             ticket.notion_page_uuid(),
             "00000000-0000-0000-0000-000000000000"
         );
+    }
+
+    #[test]
+    fn query_result_row_repairs_a_bare_id_url() {
+        let row = serde_json::json!({
+            "url": "https://app.notion.com/00000000000000000000000000000000",
+            "Task": "Fake Ticket Title",
+            "Status": "2 - Doing"
+        });
+        let ticket = parse_row(&row, "Task", "Status", None).expect("row should parse");
+        assert_eq!(
+            ticket.url,
+            "https://app.notion.com/p/00000000000000000000000000000000"
+        );
+        assert_eq!(ticket.page_id, "00000000000000000000000000000000");
     }
 
     #[test]

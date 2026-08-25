@@ -376,19 +376,25 @@ impl RenderOnce for TicketItem {
                     .label_color(status_color)
                     .label_size(LabelSize::XSmall);
                 match self.status_menu {
-                    // Anchored below the chip rather than at the cursor so the
-                    // menu doesn't cover the row that was just clicked.
                     Some((menu_id, builder)) => this.child(
-                        PopoverMenu::new(menu_id)
-                            .trigger(
-                                ButtonLike::new("ticket-status-trigger")
-                                    .style(ButtonStyle::Transparent)
-                                    .size(ButtonSize::None)
-                                    .child(chip),
+                        h_flex()
+                            .child(
+                                // Anchored below the chip rather than at the
+                                // cursor so the menu doesn't cover the row.
+                                PopoverMenu::new(menu_id)
+                                    .trigger(
+                                        ButtonLike::new("ticket-status-trigger")
+                                            .style(ButtonStyle::Transparent)
+                                            .size(ButtonSize::None)
+                                            .child(chip),
+                                    )
+                                    .menu(move |window, cx| builder(window, cx))
+                                    .anchor(Anchor::TopLeft)
+                                    .attach(Anchor::BottomLeft),
                             )
-                            .menu(move |window, cx| builder(window, cx))
-                            .anchor(Anchor::TopLeft)
-                            .attach(Anchor::BottomLeft),
+                            // Same guard as the action slot: without it the
+                            // row's own click handler also toggles the ticket.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
                     ),
                     None => this.child(chip),
                 }

@@ -1,11 +1,18 @@
 ---
 name: remote-build
-description: Run cargo build/test/clippy for this Zed fork on the fast Windows machine over SSH instead of compiling locally. Triggers on "build this", "run the tests", "cargo test", when working from the slow Linux machine.
+description: Run cargo build/test/clippy for this Zed fork on the fast Windows machine over SSH, for when the developer picks that machine over this one. Triggers on "build this", "run the tests", "cargo test".
 ---
 
 # Remote build (Windows machine over SSH)
 
-The Linux machine is for editing; it compiles this fork far too slowly. The Windows machine builds
+**Ask which machine before compiling.** Never assume. Every build, test, or clippy run starts with
+the question — Windows (this skill) or this Linux machine? — because the answer changes with what
+else the developer is doing, and only they know. State the trade-off in the question so the choice
+is informed: Windows is 16 threads and leaves this laptop free, but the binary has to travel back;
+building locally needs `-j` chosen against the RAM and free disk available at that moment (`nproc`,
+`free -h`, `df -h .`) and will compete with everything else they have open.
+
+The Linux machine is for editing and compiles this fork slowly. The Windows machine builds
 at 16 threads. `script/winrun` bridges the two: it carries the current commit over as a git bundle
 over SSH, checks that exact SHA out on the Windows machine, runs the command there, and streams the
 output back with the exit code propagated.
@@ -25,6 +32,8 @@ port opened on the Tailscale interface alone. Setting that up is a one-off; `scr
 restates what the configuration file needs.
 
 ## What to delegate
+
+Once the developer has picked Windows, this is how the work splits:
 
 | Command | Where |
 | --- | --- |

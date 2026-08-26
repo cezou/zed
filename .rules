@@ -134,10 +134,14 @@ Other entities can then register a callback to handle these events by doing `cx.
 ## Build guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+- **Ask which machine before compiling** — the Windows desktop over `script/winrun` (see the
+  `remote-build` skill) or this Linux machine. Never decide it alone: the answer depends on what the
+  developer is doing right now, and on the free RAM and disk here. When they pick local, size `-j`
+  against what `free -h` and `df -h .` report at that moment rather than defaulting to `nproc`.
 
 ## Running Zed in dev mode
 
-- Build it with the `remote-build` skill and the **`release-fast`** profile, not `dev`: only a release profile turns `debug_assertions` off, and that is what makes `rust-embed` embed the assets rather than read them off disk at the build machine's path. A dev binary cannot be moved between machines.
+- A binary built on *another* machine must use the **`release-fast`** profile, not `dev`: only a release profile turns `debug_assertions` off, and that is what makes `rust-embed` embed the assets rather than read them off disk at the build machine's path. A dev binary cannot be moved between machines. Built and run on the *same* machine, `dev` is fine — and much cheaper, since the assets it reads off disk are right there.
 - App logs go to `~/.local/share/zed/logs/Zed.log`, not stdout/stderr — check there for `log::info!`/`log::error!` output, not the terminal.
 - The channel is `dev` (`crates/zed/RELEASE_CHANNEL`), so the single-instance check is skipped and each launch is a *new* process on the same `db/0-dev` SQLite. Close the running one first, matching its exact name (`pkill -x <binary>`), or the two clobber each other's state.
 - Under WSL/remote X11 sandboxes with broken GPU passthrough (window renders solid black, stderr shows `DRI3 error`), force X11 instead of Wayland: `env -u WAYLAND_DISPLAY DISPLAY=:0 <binary>`.

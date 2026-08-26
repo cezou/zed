@@ -14,8 +14,9 @@ usage: script/winrun [--wsl] [--detach] [--no-sync] <command...>
        script/winrun [--wsl] --tail | --status
        script/winrun [--wsl] --pull <remote-path> <local-path>
 
-  (default)   push the current commit, check it out on the Windows machine, run
-              <command> there and stream its output back; exits with its code.
+  (default)   carry the current commit over, check it out on the Windows
+              machine, run <command> there and stream its output back; exits
+              with its code.
   --wsl       use the clone inside WSL instead of the Windows one, so the build
               produces Linux binaries. Implies the WSL toolchain and target dir.
   --detach    start <command> detached, writing to a log, and return
@@ -200,8 +201,25 @@ if [[ $sync -eq 1 ]]; then
         exit 1
     fi
 
-    echo "winrun: pushing $branch ($commit)" >&2
-    git push --quiet origin "HEAD:refs/heads/$branch"
+    # The commit travels as a bundle rather than as a push to the shared
+    # remote. winrun is usually run from a scratch worktree branch whose local
+    # history gets rebased, and pushing those either fails as a
+    # non-fast-forward or litters the remote with build-only branches.
+    bundle_local=$(mktemp --tmpdir winrun-sync.XXXXXXXX.bundle)
+    trap 'rm -f "$bundle_local"' EXIT
+    # Anything already on origin is left for the remote clone's own fetch, so
+    # the bundle only ever carries the local-only commits.
+    if [[ -n "$(git rev-list --max-count=1 HEAD --not --remotes=origin)" ]]; then
+        echo "winrun: bundling $branch ($commit)" >&2
+        git bundle create --quiet "$bundle_local" HEAD --not --remotes=origin
+        # target/ is gitignored, absolute, and untouched by `git checkout` —
+        # the same reasons the detach log lives there.
+        bundle_win="${ZED_WIN_REPO}\\target\\winrun-sync.bundle"
+        scp -q "$bundle_local" \
+            "$ZED_WIN_HOST:$(printf '%s' "$bundle_win" | tr '\\' '/')"
+    else
+        bundle_win=""
+    fi
 
     # Detaching onto the SHA rather than checking out the branch keeps the two
     # machines provably on the same code even if the branch moves meanwhile.
@@ -211,6 +229,11 @@ if [[ $sync -eq 1 ]]; then
 set -e
 cd '${ZED_WSL_REPO}'
 git fetch --quiet origin
+if [ -n '${bundle_win}' ]; then
+    bundle=\$(wslpath -u '${bundle_win}')
+    git fetch --quiet "\$bundle" '+HEAD:refs/winrun/sync'
+    rm -f "\$bundle"
+fi
 git checkout --quiet --detach ${commit}
 SH
     else
@@ -218,6 +241,11 @@ SH
 Set-Location '${ZED_WIN_REPO}'
 git fetch --quiet origin
 if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
+if ('${bundle_win}' -ne '') {
+    git fetch --quiet '${bundle_win}' '+HEAD:refs/winrun/sync'
+    if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
+    Remove-Item -Force '${bundle_win}'
+}
 git checkout --quiet --detach ${commit}
 exit \$LASTEXITCODE
 PS

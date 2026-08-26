@@ -6,9 +6,9 @@ description: Run cargo build/test/clippy for this Zed fork on the fast Windows m
 # Remote build (Windows machine over SSH)
 
 The Linux machine is for editing; it compiles this fork far too slowly. The Windows machine builds
-at 16 threads. `script/winrun` bridges the two: it pushes the current commit, checks that exact SHA
-out on the Windows machine, runs the command there, and streams the output back with the exit code
-propagated.
+at 16 threads. `script/winrun` bridges the two: it carries the current commit over as a git bundle
+over SSH, checks that exact SHA out on the Windows machine, runs the command there, and streams the
+output back with the exit code propagated.
 
 Requires `~/.config/zed-winrun.env`. It lives outside the repo on purpose — this is a public fork,
 and the host name and paths belong to the developer's machines, not to the project:
@@ -113,7 +113,11 @@ and carried by scp over the SFTP subsystem, which never touches a shell.
   build, which is why Zed leaves it off.
 
 - **Commit first.** `winrun` refuses to run with a dirty working tree, because the Windows machine
-  builds what was pushed — a build of un-pushed edits would be a lie. Commit, then delegate.
+  builds a commit — a build of uncommitted edits would be a lie. Commit, then delegate.
+- **Nothing is pushed to the remote.** The commit travels as a bundle of whatever is not yet on
+  `origin`, staged under `target/` on the Windows side and fetched into `refs/winrun/sync` there.
+  Pushing was the old mechanism; it broke on scratch worktree branches that get rebased locally
+  (non-fast-forward) and littered the shared remote with build-only branches.
 - **The Windows machine ends up on a detached HEAD** at the SHA that was built. That is deliberate:
   it makes "what exactly did we compile" answerable. Don't "fix" it by checking out a branch there.
 - **No GUI over SSH.** Commands from sshd run outside the interactive desktop session, so the

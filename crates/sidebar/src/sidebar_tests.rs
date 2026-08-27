@@ -1867,6 +1867,18 @@ async fn init_test_project_with_agent_panel(
     worktree_path: &str,
     cx: &mut TestAppContext,
 ) -> Entity<project::Project> {
+    init_test_project_with_agent_panel_fs(worktree_path, cx)
+        .await
+        .1
+}
+
+/// Same as [`init_test_project_with_agent_panel`], but also hands back the fake
+/// fs, so a test can add a second project — a ticket's worktree, say — to the
+/// window with [`add_test_project`].
+async fn init_test_project_with_agent_panel_fs(
+    worktree_path: &str,
+    cx: &mut TestAppContext,
+) -> (Arc<FakeFs>, Entity<project::Project>) {
     init_agent_ui_test(cx);
     cx.update(|cx| {
         cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
@@ -1883,7 +1895,9 @@ async fn init_test_project_with_agent_panel(
     fs.insert_tree(worktree_path, serde_json::json!({ "src": {} }))
         .await;
     cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
-    project::Project::test(fs, [worktree_path.as_ref()], cx).await
+    let project =
+        project::Project::test(fs.clone() as Arc<dyn fs::Fs>, [worktree_path.as_ref()], cx).await;
+    (fs, project)
 }
 
 fn add_agent_panel(
@@ -15425,6 +15439,122 @@ async fn test_expanding_a_ticket_inserts_its_session_rows(cx: &mut TestAppContex
             "  v #Fix the widget",
             "    ~claude session"
         ]
+    );
+}
+
+#[gpui::test]
+async fn test_activating_a_ticket_switches_to_its_open_worktree(cx: &mut TestAppContext) {
+    let (fs, project) = init_test_project_with_agent_panel_fs("/my-project", cx).await;
+    fs.insert_tree("/my-project-feature", serde_json::json!({ "src": {} }))
+        .await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let worktree_workspace =
+        add_test_project("/my-project-feature", &fs, &multi_workspace, cx).await;
+    let main_workspace = multi_workspace.update_in(cx, |mw, window, cx| {
+        let workspace = mw.workspaces().next().unwrap().clone();
+        mw.activate(workspace.clone(), None, window, cx);
+        workspace
+    });
+
+    let ticket_id = seed_ticket(
+        "ticket-a",
+        "Fix the widget",
+        Some((
+            PathBuf::from("/my-project-feature"),
+            PathBuf::from("/my-project"),
+            "feature",
+        )),
+        cx,
+    );
+    seed_ticket_session(
+        &ticket_id,
+        "claude session",
+        "/my-project",
+        "/my-project-feature",
+        &panel,
+        cx,
+    );
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    assert_ne!(
+        multi_workspace.read_with(cx, |mw, _| mw.workspace().clone()),
+        worktree_workspace,
+        "the main workspace must be the active one before the ticket is activated"
+    );
+
+    let ticket_index = visible_entries_as_strings(&sidebar, cx)
+        .iter()
+        .position(|entry| entry.contains("Fix the widget"))
+        .expect("the ticket row should be visible");
+    focus_sidebar(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(ticket_index);
+    });
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |mw, _| mw.workspace().clone()),
+        worktree_workspace,
+        "activating a ticket should switch this window to its worktree"
+    );
+    assert_ne!(worktree_workspace, main_workspace);
+    assert!(
+        sidebar.read_with(cx, |sidebar, _cx| sidebar.expanded_tickets.is_empty()),
+        "activating a ticket must no longer expand its sessions — that is the arrow's job"
+    );
+    assert!(
+        !visible_entries_as_strings(&sidebar, cx)
+            .iter()
+            .any(|entry| entry.contains("claude session")),
+        "the ticket's session rows must stay hidden"
+    );
+}
+
+#[gpui::test]
+async fn test_activating_a_ticket_whose_worktree_is_closed_does_not_expand_it(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let ticket_id = seed_ticket(
+        "ticket-a",
+        "Fix the widget",
+        Some((
+            PathBuf::from("/my-project-feature"),
+            PathBuf::from("/my-project"),
+            "feature",
+        )),
+        cx,
+    );
+    seed_ticket_session(
+        &ticket_id,
+        "claude session",
+        "/my-project",
+        "/my-project-feature",
+        &panel,
+        cx,
+    );
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    focus_sidebar(&sidebar, cx);
+    sidebar.update_in(cx, |sidebar, _window, _cx| {
+        sidebar.selection = Some(1);
+    });
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+
+    assert!(
+        sidebar.read_with(cx, |sidebar, _cx| sidebar.expanded_tickets.is_empty()),
+        "a ticket whose worktree is not open yet must not expand either"
     );
 }
 

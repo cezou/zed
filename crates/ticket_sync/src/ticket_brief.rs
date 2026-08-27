@@ -32,9 +32,11 @@ pub fn render_brief(ticket: &TicketRef, body: Option<&str>) -> String {
         brief.push_str(&format!("_{subtitle}_\n"));
     }
 
-    let url = ticket.url.trim();
+    // Records synced before the url normalization in `parse_row` landed still hold
+    // the unopenable bare-id form, and this brief is what the session gets handed.
+    let url = notion_client::normalize_page_url(ticket.url.trim());
     if !url.is_empty() {
-        brief.push_str(url);
+        brief.push_str(&url);
         brief.push('\n');
     }
 
@@ -113,6 +115,17 @@ mod tests {
                 "- ask before destructive git operations\n",
                 "- no push / no MR\n",
             )
+        );
+    }
+
+    #[test]
+    fn test_render_brief_repairs_a_bare_id_url() {
+        let mut ticket = ticket();
+        ticket.url = "https://app.notion.com/3aadcbda9c3580848c28cde0304259bc".into();
+        let brief = render_brief(&ticket, Some("Body."));
+        assert!(
+            brief.contains("https://app.notion.com/p/3aadcbda9c3580848c28cde0304259bc\n"),
+            "brief should carry the openable url, got:\n{brief}"
         );
     }
 

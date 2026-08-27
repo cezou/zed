@@ -152,10 +152,7 @@ fn extract_tagged_blocks<'a>(text: &'a str, tag: &str) -> Vec<(Option<&'a str>, 
     let close_tag = format!("</{tag}>");
     let mut rest = text;
     let mut search_from = 0;
-    loop {
-        let Some(found) = rest[search_from..].find(&open_prefix) else {
-            break;
-        };
+    while let Some(found) = rest[search_from..].find(&open_prefix) {
         let start = search_from + found;
         // Notion's fetch output wraps same-named blocks in a pluralized
         // container (e.g. `<views>` around `<view>` entries, `<data-sources>`
@@ -722,37 +719,35 @@ mod tests {
         // status_is filter must still parse — this is the exact shape that
         // would break a naive `value: String`-typed FilterValueEntry.
         let state: DataSourceState = serde_json::from_str(fixture_data_source_state()).unwrap();
-        let view_json = format!(
-            r#"{{
+        let view_json = r#"{
                 "name": "Mixed Filters",
                 "dataSourceUrl": "collection://fake-data-source-id",
                 "simpleFilters": [
-                    {{
-                        "filter": {{
+                    {
+                        "filter": {
                             "operator": "checkbox_is",
                             "property": "Blocked",
                             "propertyType": "checkbox",
-                            "value": {{ "type": "exact", "value": false }}
-                        }}
-                    }},
-                    {{
-                        "filter": {{
+                            "value": { "type": "exact", "value": false }
+                        }
+                    },
+                    {
+                        "filter": {
                             "operator": "status_is",
                             "property": "Status",
                             "propertyType": "status",
-                            "value": {{"type": "is_option", "value": "4 - Done"}}
-                        }}
-                    }},
-                    {{
-                        "filter": {{
+                            "value": {"type": "is_option", "value": "4 - Done"}
+                        }
+                    },
+                    {
+                        "filter": {
                             "operator": "is_empty",
                             "property": "Owner",
                             "propertyType": "person"
-                        }}
-                    }}
+                        }
+                    }
                 ]
-            }}"#
-        );
+            }"#;
         let view: ViewDef =
             serde_json::from_str(&view_json).expect("mixed-filter view should parse");
         let config = build_board_config(view, state).expect("should build config");

@@ -443,6 +443,9 @@ impl TicketSectionKey {
 struct TicketEntry {
     record: Arc<TicketWorktreeRecord>,
     worktree_label: Option<SharedString>,
+    /// The workspace of the ticket's own worktree, so its row can switch to it
+    /// the way a session row does. `None` until the ticket has a worktree.
+    workspace: Option<ThreadEntryWorkspace>,
     session_state: TicketSessionState,
     sessions: Vec<TicketSessionEntry>,
     highlight_positions: Vec<usize>,
@@ -1458,10 +1461,23 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let path_list = project_group_key.path_list().clone();
+        self.open_workspace_for_paths(path_list, project_group_key, window, cx);
+    }
+
+    /// Opens a workspace on `path_list` — which may be a worktree of the group
+    /// rather than the group's own paths — and makes it this window's active
+    /// one.
+    fn open_workspace_for_paths(
+        &mut self,
+        path_list: PathList,
+        project_group_key: &ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
-        let path_list = project_group_key.path_list().clone();
         let host = project_group_key.host();
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
@@ -3950,8 +3966,8 @@ impl Sidebar {
                 self.toggle_ticket_section_collapsed(key, cx);
             }
             ListEntry::Ticket(ticket) => {
-                let ticket_id = ticket.record.ticket_id.clone();
-                self.toggle_ticket_expanded(ticket_id, cx);
+                let ticket = ticket.clone();
+                self.activate_ticket(&ticket, window, cx);
             }
             ListEntry::TicketSession(session) => {
                 let metadata = session.metadata.clone();
@@ -8366,10 +8382,24 @@ impl Sidebar {
                         .map(|name| SharedString::from(name.to_string_lossy().to_string()))
                 });
 
+            // Keyed exactly as the sessions above are, so the ticket row and
+            // its session rows switch to the same workspace.
+            let workspace = record.worktree_path.clone().map(|worktree_path| {
+                let folder_paths = PathList::new(&[worktree_path]);
+                match workspace_by_path_list.get(&folder_paths) {
+                    Some(workspace) => ThreadEntryWorkspace::Open(workspace.clone()),
+                    None => ThreadEntryWorkspace::Closed {
+                        folder_paths,
+                        project_group_key: session_group_key.clone(),
+                    },
+                }
+            });
+
             let entry = TicketEntry {
                 has_notification: sessions.iter().any(|session| session.has_notification),
                 record: Arc::new(record.clone()),
                 worktree_label,
+                workspace,
                 session_state,
                 sessions,
                 highlight_positions: Vec::new(),
@@ -8517,6 +8547,42 @@ impl Sidebar {
     fn toggle_ticket_section_collapsed(&mut self, key: TicketSectionKey, cx: &mut Context<Self>) {
         let collapsed = !self.collapsed_ticket_sections.contains(&key);
         self.set_ticket_section_collapsed(key, collapsed, cx);
+    }
+
+    /// What activating a ticket row does: switch this window's view to the
+    /// ticket's worktree, or, for a ticket that has none yet, offer to start
+    /// work on it. Expanding the sessions stays on the disclosure arrow.
+    fn activate_ticket(
+        &mut self,
+        ticket: &TicketEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match ticket.workspace.clone() {
+            Some(workspace) => self.activate_ticket_workspace(workspace, window, cx),
+            None => self.start_ticket_work(ticket.record.ticket_id.clone(), false, window, cx),
+        }
+    }
+
+    /// The workspace switch a ticket session's row performs, without the
+    /// terminal — see [`Self::activate_terminal_entry`].
+    fn activate_ticket_workspace(
+        &mut self,
+        workspace: ThreadEntryWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match workspace {
+            ThreadEntryWorkspace::Open(workspace) => {
+                self.activate_workspace(&workspace, window, cx);
+            }
+            ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            } => {
+                self.open_workspace_for_paths(folder_paths, &project_group_key, window, cx);
+            }
+        }
     }
 
     /// Asks what to delete along with the ticket's worktree, then closes it.
@@ -8959,14 +9025,14 @@ impl Sidebar {
             cx.notify();
         }))
         .when(is_hovered, |this| this.action_slot(action_slot))
-        .on_toggle(cx.listener({
-            let ticket_id = ticket_id.clone();
-            move |this, _, _window, cx| {
-                this.toggle_ticket_expanded(ticket_id.clone(), cx);
-            }
-        }))
-        .on_click(cx.listener(move |this, _, _window, cx| {
+        .on_toggle(cx.listener(move |this, _, _window, cx| {
             this.toggle_ticket_expanded(ticket_id.clone(), cx);
+        }))
+        .on_click(cx.listener({
+            let ticket = ticket.clone();
+            move |this, _, window, cx| {
+                this.activate_ticket(&ticket, window, cx);
+            }
         }))
         .into_any_element();
 

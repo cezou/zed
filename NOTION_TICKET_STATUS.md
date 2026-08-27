@@ -3,7 +3,10 @@
 **Delete this file when this branch is merged into `main`.** It exists only to hand the work over
 between machines; it is not documentation the fork should keep.
 
-Branch: `worktree-notion-ticket-status`, rebased on `origin/main` (`8239d30556`).
+Branch: `notion-ticket-status`, on `origin/main` (`1a0fcdd45e`). It merges the two earlier
+branches: everything on `worktree-fix-notion-ticket-url` was already in `main` except its tip
+(`Repair Notion ticket links that arrive as a bare page id`), which is cherry-picked here alongside
+the two `worktree-notion-ticket-status` feature commits and the `winrun` removal.
 
 ## What was asked
 
@@ -81,34 +84,58 @@ need `TicketRef::notion_page_uuid()` / `notion_client::extract_page_id(&record.u
 At the user's request. Nothing on the Linux laptop is to drive builds on the desktop any more; work
 moves between machines through git only.
 
-**Follow-up needed when merging:** `CLAUDE.md` and `.rules` (both line ~140, "Running Zed in dev
-mode") still tell agents to "build it with the `remote-build` skill". That skill no longer exists, so
-the sentence needs rewriting to say the build happens on the desktop directly. Left untouched here on
-purpose — this fork's own rules hygiene section says not to edit `.rules` inline during feature work.
+**Follow-up done:** the "Running Zed in dev mode" rule pointed at the now-deleted `remote-build`
+skill; it is rewritten in its own commit to describe a local build. (`CLAUDE.md` is a symlink to
+`.rules`, so there is only one file to change, not two.)
+
+## Also on this branch: the ticket url fix
+
+Notion's query engine hands rows back as `https://app.notion.com/<32hex>` on this workspace, which
+**404s** — only `https://app.notion.com/p/<32hex>` resolves. Both were checked against the live
+workspace with `curl -I`. `normalize_page_url()` in `notion_client` rewrites the bare-id shape and
+leaves every other shape alone; it is applied at three points: `parse_row` (so new syncs store the
+openable form), the sidebar's link (for rows synced before the fix), and `render_brief` (the
+`brief.md` a session is handed — the one already on disk carries the 404 form).
 
 ## Verification status
 
-The code was checked earlier in the session, but **on the pre-rebase base**, and the equivalent runs
-were not repeated after rebasing onto `8239d30556`. Treat the results below as indicative, and
-re-run them on the desktop before trusting them:
+Re-run on the Windows desktop on this exact tree (2026-08-27), `dev` profile, 16 threads:
 
-- `cargo check -p ticket_sync -p sidebar -p notion_client -p agent_ui -p ui` — clean.
-- `cargo clippy` on those five crates, `--all-targets` — no new warnings (the two remaining
-  `notion_client` ones predate this branch: a `while_let_loop` in `extract_tagged_blocks` and a
-  `useless_format` in a test).
-- `cargo test -p sidebar` — 150 passed. `cargo test -p notion_client -p agent_ui` — 438 + 33 passed.
+- `cargo build -p zed` — clean in 3m03s from the shared `target/`. The only warning is a
+  pre-existing `LNK4217` between `wasmtime_c_api` and `tree_sitter`.
+- `cargo clippy -p ticket_sync -p sidebar -p notion_client -p agent_ui -p ui --all-targets` —
+  exit 0, no new warnings. The two `notion_client` ones predate this work: a `while_let_loop` in
+  `extract_tagged_blocks` and a `useless_format` in a test.
+- `cargo test -p notion_client -p sidebar -p ticket_sync` — 39 + 150 + 11 passed, 0 failed.
 
-Note: whole-workspace `script/clippy` failed for an unrelated reason — `wasmtime-c-api-impl`'s build
-script could not find `cmake`.
+Note: whole-workspace `script/clippy` needs `cmake`, which ships with Visual Studio but is not on
+`PATH`; prepend
+`C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`.
 
-**Not verified at all: the UI itself.** Nothing here has been clicked. What to check from the Windows
-desktop with the `run-zed` skill:
+### UI, verified by driving the app
 
-1. Click a ticket's status chip in the sidebar → the menu lists the 8 tracked statuses with the
-   current one checked; the row must **not** expand/collapse from that click.
-2. Pick another status → the chip updates immediately, and the Notion page really changes.
-3. Open the launch modal on a `2 - 🏁 Ready for dev` ticket → header reads
-   `2 - 🏁 Ready for dev → 3 - ⏳ In progress`; launch → session starts **and** Notion moves.
-4. Launch with "Keep as is" → no status write.
-5. Break the OAuth token and repeat (2): expect an error notification and the chip reverting to its
-   old value.
+1. **Status picker** — confirmed. Clicking a ticket's status chip opens a menu listing exactly the
+   8 statuses from `notion_status_filter`, with the ticket's current one (`3 - ⏳ In progress`)
+   checked, and the row does **not** expand from that click.
+2. **Section label** — confirmed, the section reads "No sessions".
+3. **Launch moves the ticket in Notion** — confirmed end to end, though by accident: a stray click
+   launched a real session on "Spider tap_portugal non fonctionnelle en canary", and the Notion page
+   moved `2 - 🏁 Ready for dev` → `3 - ⏳ In progress` (verified by querying the board afterwards).
+   The generated `.zed-ticket/brief.md` also carried the repaired `/p/` url.
+
+Still unverified, and needing a deliberate run rather than a stray click:
+
+- The launch modal's `before → after` header and overriding the *after*, including "Keep as is"
+  (writes nothing).
+- The failure path: with a broken OAuth token, picking a status should show an error notification
+  and revert the chip.
+
+### The `run-zed` skill's UI Automation path is currently broken
+
+`list-elements` returns an empty tree on this build: the window's UIA root (`Zed::Window`) is found,
+but `FindAll(Descendants)` reports 0 nodes, and stays at 0 after foreground activation and several
+frames. The `gpui_windows` AccessKit bridge and the `WM_GETOBJECT` dispatch are both present in the
+source, so the adapter is simply never activating. This is independent of this branch — it needs its
+own investigation. `screenshot` still works, so the verification above was done with geometric
+clicks derived from the screenshots, which is fragile: the ticket list reorders under you on each
+Notion poll, and that is exactly how the stray launch happened.

@@ -16,7 +16,8 @@ Run when the user says **"c'est bon, MR"**, **"c'est bon, PR"** or **"vasy push"
 6. **Unit tests** — add/adapt them. `cargo test -p <crate>` (or `cargo nextest run -p <crate>`). In GPUI tests use `cx.background_executor().timer(…)`, never `smol::Timer::after`.
 7. **fmt + clippy** — `cargo fmt --all`, then `./script/clippy -p <crate>` (`script/clippy.ps1` on Windows). Both must be clean; clippy runs `--deny warnings`. It builds `--release`, so on Windows put VS's cmake on `PATH` first or `wasmtime-c-api-impl` fails.
 8. **Commit** — one commit (squash if >1). **Not** Conventional Commits: imperative, capitalized title, optional `crate_name:` prefix, no trailing period. End with `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
-9. **Push + PR** — `gh pr create`, or update if one exists (`gh pr list --head <branch>`). Never on `main`.
+9. **Push + PR** — `gh pr create`, or update if one exists (`gh pr list --repo cezou/zed --head <branch>`). Never on `main`.
+   - **Always pass `--repo cezou/zed --base main` explicitly.** This repo is a fork of `zed-industries/zed`, and `gh` resolves a fork's default PR target to the **upstream** — so a bare `gh pr create` opens a public pull request against Zed itself. Same for every other `gh` call here: `gh pr list/view/merge --repo cezou/zed`. `gh repo set-default` does **not** override a fork's PR-target resolution; the flag does.
 
 ## Commit & PR text
 

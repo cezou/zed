@@ -1,3 +1,4 @@
+mod close_ticket_modal;
 mod thread_switcher;
 
 use acp_thread::ThreadStatus;
@@ -16,7 +17,9 @@ use agent_ui::threads_archive_view::{
     fuzzy_match_positions,
 };
 use agent_ui::terminal_thread_metadata_store::ClaudeActivity;
-use agent_ui::ticket_metadata_store::{TicketId, TicketMetadataStore, TicketWorktreeRecord};
+use agent_ui::ticket_metadata_store::{
+    self, TicketId, TicketMetadataStore, TicketSyncState, TicketWorktreeRecord,
+};
 use agent_ui::{
     AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo,
     AgentThreadSource, ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE,
@@ -32,8 +35,7 @@ use feature_flags::{
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
     FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -80,6 +82,7 @@ use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenRecent};
 
 use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
 
+use crate::close_ticket_modal::CloseTicketModal;
 use crate::thread_switcher::{
     ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent, ThreadSwitcherSelection,
     ThreadSwitcherTerminalEntry, ThreadSwitcherThreadEntry,
@@ -516,7 +519,7 @@ struct TicketBuckets {
     by_group: HashMap<ProjectGroupKey, Vec<TicketEntry>>,
     /// Keyed by [`TicketSectionKey::sort_key`] so section order is stable.
     unopened_repos: BTreeMap<(PathBuf, String), (TicketSectionKey, Vec<TicketEntry>)>,
-    ready_for_dev: Vec<TicketEntry>,
+    no_sessions: Vec<TicketEntry>,
     /// Every terminal that belongs to a ticket session, expanded or not. The
     /// project-group loop uses this to avoid emitting those terminals a second
     /// time as plain `ListEntry::Terminal` rows.
@@ -2230,7 +2233,7 @@ impl Sidebar {
         ticket_sections.push((
             TicketSectionKey::NoSessions,
             NO_SESSIONS_SECTION_LABEL.into(),
-            mem::take(&mut ticket_buckets.ready_for_dev),
+            mem::take(&mut ticket_buckets.no_sessions),
         ));
 
         for (key, label, tickets) in ticket_sections {
@@ -8377,7 +8380,7 @@ impl Sidebar {
                     buckets.by_group.entry(group_key).or_default().push(entry);
                 }
                 (None, Some(TicketSectionKey::NoSessions)) => {
-                    buckets.ready_for_dev.push(entry);
+                    buckets.no_sessions.push(entry);
                 }
                 (None, Some(section_key)) => {
                     buckets
@@ -8516,6 +8519,289 @@ impl Sidebar {
         self.set_ticket_section_collapsed(key, collapsed, cx);
     }
 
+    /// Asks what to delete along with the ticket's worktree, then closes it.
+    ///
+    /// The branch is a separate, pre-checked choice rather than part of the
+    /// confirm button: dropping the worktree alone always leaves the commits
+    /// reachable, while deleting the branch is what can actually lose work.
+    fn prompt_close_ticket(
+        &mut self,
+        ticket: &TicketEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let record = ticket.record.clone();
+        let (Some(worktree_path), Some(branch_name), Some(repo_path)) = (
+            record.worktree_path.clone(),
+            record.branch_name.clone(),
+            record.base_repo_root.clone(),
+        ) else {
+            self.show_ticket_toast("This ticket has no worktree to close.".to_string(), cx);
+            return;
+        };
+        let terminal_ids: Vec<TerminalId> = ticket
+            .sessions
+            .iter()
+            .map(|session| session.metadata.terminal_id)
+            .collect();
+        let sessions = match terminal_ids.len() {
+            0 => "No sessions".to_string(),
+            1 => "1 session".to_string(),
+            count => format!("{count} sessions"),
+        };
+        let detail = format!(
+            "{sessions} and the worktree at {} go away.",
+            worktree_path.display()
+        );
+
+        let sidebar = cx.weak_entity();
+        self.open_close_ticket_modal(
+            format!("Close \"{}\"?", record.title),
+            detail,
+            Some(SharedString::from(branch_name.clone())),
+            "Close Ticket",
+            Some(worktree_path.clone()),
+            window,
+            cx,
+            move |delete_branch, window, cx| {
+                sidebar
+                    .update(cx, |sidebar, cx| {
+                        sidebar.close_ticket(
+                            record.ticket_id.clone(),
+                            repo_path.clone(),
+                            branch_name.clone(),
+                            worktree_path.clone(),
+                            terminal_ids.clone(),
+                            delete_branch,
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+            },
+        );
+    }
+
+    /// Puts a confirmation in front of the user as a Zed modal. `window.prompt`
+    /// would be a native message box on Windows — outside the window, in the
+    /// OS' style, and unable to carry the branch checkbox.
+    #[allow(clippy::too_many_arguments)]
+    fn open_close_ticket_modal(
+        &self,
+        title: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        branch: Option<SharedString>,
+        confirm_label: impl Into<SharedString>,
+        worktree_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_confirm: impl FnOnce(bool, &mut Window, &mut App) + 'static,
+    ) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let title = title.into();
+        let detail = detail.into();
+        let confirm_label = confirm_label.into();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |_window, cx| {
+                CloseTicketModal::new(
+                    title,
+                    detail,
+                    branch,
+                    confirm_label,
+                    worktree_path,
+                    on_confirm,
+                    cx,
+                )
+            });
+        });
+    }
+    /// Tears a ticket's worktree down: its sessions stop being tracked, the
+    /// workspace opened on the worktree leaves this window (a project still
+    /// holding the directory is what makes a worktree removal fail on Windows),
+    /// then `git gtr rm` deletes it. The ticket keeps its Notion row and simply
+    /// goes back to having no worktree.
+    #[allow(clippy::too_many_arguments)]
+    fn close_ticket(
+        &mut self,
+        ticket_id: TicketId,
+        repo_path: PathBuf,
+        branch_name: String,
+        worktree_path: PathBuf,
+        terminal_ids: Vec<TerminalId>,
+        delete_branch: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_list = PathList::new(std::slice::from_ref(&worktree_path));
+        let workspace_on_worktree = self.find_current_workspace_for_path_list(&path_list, None, cx);
+
+        // Killing the terminals has to happen through the panel that owns them:
+        // dropping their metadata alone leaves the processes running, and the
+        // shell then sits in a directory that is about to be deleted — which is
+        // exactly the `os error 267` a surviving Claude session reports.
+        if let Some(workspace) = &workspace_on_worktree {
+            workspace.update(cx, |workspace, cx| {
+                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                    panel.update(cx, |panel, cx| {
+                        for terminal_id in &terminal_ids {
+                            panel.close_terminal_without_activating_draft(*terminal_id, window, cx);
+                        }
+                    });
+                }
+            });
+        }
+
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                for terminal_id in &terminal_ids {
+                    store.delete(*terminal_id, cx);
+                }
+            });
+        }
+
+        self.remove_workspaces_then(
+            workspace_on_worktree.into_iter().collect(),
+            Vec::new(),
+            window,
+            cx,
+            move |this, window, cx| {
+                this.remove_ticket_worktree(
+                    ticket_id,
+                    repo_path,
+                    branch_name,
+                    worktree_path,
+                    delete_branch,
+                    false,
+                    window,
+                    cx,
+                );
+            },
+        );
+    }
+
+    /// Runs `git gtr rm` and, on success, forgets the ticket's worktree.
+    ///
+    /// gtr fails the whole command for things that leave nothing to retry — a
+    /// worktree it no longer finds, a branch `git branch -D` refused after the
+    /// directory was already gone — so the on-disk state, not the exit code,
+    /// decides what happened. Only a worktree that is still there gets the
+    /// second, louder prompt offering to force.
+    #[allow(clippy::too_many_arguments)]
+    fn remove_ticket_worktree(
+        &mut self,
+        ticket_id: TicketId,
+        repo_path: PathBuf,
+        branch_name: String,
+        worktree_path: PathBuf,
+        delete_branch: bool,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let repo_path = repo_path.clone();
+                    let branch_name = branch_name.clone();
+                    async move {
+                        ticket_metadata_store::run_gtr_rm(
+                            &repo_path,
+                            &branch_name,
+                            delete_branch,
+                            force,
+                        )
+                        .await
+                    }
+                })
+                .await;
+
+            let error = match result {
+                Ok(()) => {
+                    this.update(cx, |this, cx| this.forget_closed_ticket(&ticket_id, cx))?;
+                    return anyhow::Ok(());
+                }
+                Err(error) => error,
+            };
+
+            let worktree_is_gone = cx
+                .background_spawn({
+                    let worktree_path = worktree_path.clone();
+                    async move { !worktree_path.exists() }
+                })
+                .await;
+            if worktree_is_gone {
+                this.update(cx, |this, cx| {
+                    this.forget_closed_ticket(&ticket_id, cx);
+                    this.show_ticket_toast(format!("Worktree removed, but: {error:#}"), cx);
+                })?;
+                return anyhow::Ok(());
+            }
+
+            if force {
+                this.update(cx, |this, cx| {
+                    this.show_ticket_toast(format!("Failed to remove worktree: {error:#}"), cx);
+                })?;
+                return anyhow::Ok(());
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                let sidebar = cx.weak_entity();
+                this.open_close_ticket_modal(
+                    "Force-remove this worktree?",
+                    format!("{error:#}"),
+                    None,
+                    "Force Remove",
+                    None,
+                    window,
+                    cx,
+                    move |_, window, cx| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.remove_ticket_worktree(
+                                    ticket_id.clone(),
+                                    repo_path.clone(),
+                                    branch_name.clone(),
+                                    worktree_path.clone(),
+                                    delete_branch,
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    },
+                );
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Drops the ticket's worktree record, which is what puts its row back
+    /// among the tickets with no session.
+    fn forget_closed_ticket(&mut self, ticket_id: &TicketId, cx: &mut Context<Self>) {
+        if let Some(store) = TicketMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| store.delete_worktree(ticket_id, cx));
+        }
+        self.update_entries(cx);
+    }
+
+    fn show_ticket_toast(&self, message: String, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspace = multi_workspace.read(cx).workspace().clone();
+        workspace.update(cx, |workspace, cx| {
+            struct TicketToast;
+            workspace.show_toast(
+                Toast::new(NotificationId::unique::<TicketToast>(), message).autohide(),
+                cx,
+            );
+        });
+    }
+
     /// Entry point for starting work on a ticket. Wired to the launch modal
     /// once that lands; deliberately inert for now so this task does not race
     /// the signature change happening in the launch path.
@@ -8605,7 +8891,7 @@ impl Sidebar {
                     })),
             );
 
-        TicketItem::new(
+        let ticket_item = TicketItem::new(
             SharedString::from(format!("ticket-entry-{ix}")),
             record.title.clone(),
         )
@@ -8682,7 +8968,32 @@ impl Sidebar {
         .on_click(cx.listener(move |this, _, _window, cx| {
             this.toggle_ticket_expanded(ticket_id.clone(), cx);
         }))
-        .into_any_element()
+        .into_any_element();
+
+        if !has_worktree {
+            return ticket_item;
+        }
+
+        let sidebar = cx.weak_entity();
+        let ticket = ticket.clone();
+        right_click_menu(SharedString::from(format!("ticket-context-menu-{ix}")))
+            .trigger(move |_, _, _| ticket_item)
+            .menu(move |window, cx| {
+                let sidebar = sidebar.clone();
+                let ticket = ticket.clone();
+                ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.entry("Close Ticket and Delete Worktree…", None, {
+                        move |window, cx| {
+                            sidebar
+                                .update(cx, |sidebar, cx| {
+                                    sidebar.prompt_close_ticket(&ticket, window, cx);
+                                })
+                                .ok();
+                        }
+                    })
+                })
+            })
+            .into_any_element()
     }
 
     fn render_ticket_session(
@@ -8872,6 +9183,8 @@ impl Sidebar {
                     )
                 },
             )
+            .child(div().flex_1())
+            .child(self.render_ticket_sync_button(ix, cx))
             .child(
                 Icon::new(disclosure_icon)
                     .size(IconSize::Small)
@@ -8880,6 +9193,42 @@ impl Sidebar {
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.toggle_ticket_section_collapsed(key.clone(), cx);
             }))
+            .into_any_element()
+    }
+
+    /// Pulls the Notion board again on demand. The poll is on a multi-minute
+    /// timer, so a status changed in Notion a moment ago is only visible here
+    /// once someone asks for it.
+    fn render_ticket_sync_button(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let sync_state = TicketMetadataStore::try_global(cx)
+            .map(|store| store.read(cx).sync_state().clone())
+            .unwrap_or_default();
+
+        if sync_state == TicketSyncState::Syncing {
+            return Icon::new(IconName::ArrowCircle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .with_keyed_rotate_animation(format!("ticket-sync-spinner-{ix}"), 2)
+                .into_any_element();
+        }
+
+        let tooltip = match &sync_state {
+            TicketSyncState::Failed(error) => {
+                format!("Sync Tickets from Notion — last sync failed: {error}")
+            }
+            _ => "Sync Tickets from Notion".to_string(),
+        };
+        IconButton::new(("sync-notion-tickets", ix), IconName::ArrowCircle)
+            .icon_size(IconSize::Small)
+            .icon_color(if matches!(sync_state, TicketSyncState::Failed(_)) {
+                Color::Error
+            } else {
+                Color::Muted
+            })
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(agent_ui::SyncNotionTickets), cx);
+            })
             .into_any_element()
     }
 }

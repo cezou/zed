@@ -152,10 +152,7 @@ fn extract_tagged_blocks<'a>(text: &'a str, tag: &str) -> Vec<(Option<&'a str>, 
     let close_tag = format!("</{tag}>");
     let mut rest = text;
     let mut search_from = 0;
-    loop {
-        let Some(found) = rest[search_from..].find(&open_prefix) else {
-            break;
-        };
+    while let Some(found) = rest[search_from..].find(&open_prefix) {
         let start = search_from + found;
         // Notion's fetch output wraps same-named blocks in a pluralized
         // container (e.g. `<views>` around `<view>` entries, `<data-sources>`
@@ -505,6 +502,74 @@ pub async fn set_page_status(
     Ok(())
 }
 
+/// Looks tickets up by their page url, ignoring the board's status and
+/// assignee filters.
+///
+/// [`query_tickets`] can only ever return what the filter matches, so a ticket
+/// that moved to a status outside it — or was reassigned — silently stops being
+/// reported and its last-seen status would stand forever. This is how a ticket
+/// someone is still working in gets its real status back.
+pub async fn query_tickets_by_url(
+    client: &mut McpClient,
+    config: &McpBoardConfig,
+    urls: &[String],
+) -> Result<Vec<TicketRef>, McpError> {
+    if urls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", urls.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let issue_id_column = config
+        .issue_id_property
+        .as_deref()
+        .map(|property| format!(", \"{}\"", property.replace('"', "\"\"")))
+        .unwrap_or_default();
+    let query = format!(
+        "SELECT url, \"{title}\", \"{status}\"{issue_id_column} FROM \"{data_source}\" WHERE url IN ({placeholders})",
+        title = config.title_property,
+        status = config.status_property,
+        data_source = config.data_source_url,
+    );
+    let params: Vec<Value> = urls.iter().cloned().map(Value::String).collect();
+
+    let result = client
+        .call_tool(
+            "notion-query-data-sources",
+            json!({
+                "data": {
+                    "data_source_urls": [config.data_source_url],
+                    "query": query,
+                    "params": params,
+                }
+            }),
+        )
+        .await?;
+    if result.is_error {
+        return Err(McpError::Other(format!(
+            "notion-query-data-sources returned an error: {}",
+            result.joined_text()
+        )));
+    }
+    let payload = result.payload()?;
+    let envelope: QueryResultsEnvelope = serde_json::from_value(payload)
+        .map_err(|error| McpError::Other(format!("unexpected query result shape: {error}")))?;
+
+    Ok(envelope
+        .results
+        .iter()
+        .filter_map(|row| {
+            parse_row(
+                row,
+                &config.title_property,
+                &config.status_property,
+                config.issue_id_property.as_deref(),
+            )
+        })
+        .collect())
+}
+
 fn parse_row(
     row: &Value,
     title_property: &str,
@@ -654,37 +719,35 @@ mod tests {
         // status_is filter must still parse — this is the exact shape that
         // would break a naive `value: String`-typed FilterValueEntry.
         let state: DataSourceState = serde_json::from_str(fixture_data_source_state()).unwrap();
-        let view_json = format!(
-            r#"{{
+        let view_json = r#"{
                 "name": "Mixed Filters",
                 "dataSourceUrl": "collection://fake-data-source-id",
                 "simpleFilters": [
-                    {{
-                        "filter": {{
+                    {
+                        "filter": {
                             "operator": "checkbox_is",
                             "property": "Blocked",
                             "propertyType": "checkbox",
-                            "value": {{ "type": "exact", "value": false }}
-                        }}
-                    }},
-                    {{
-                        "filter": {{
+                            "value": { "type": "exact", "value": false }
+                        }
+                    },
+                    {
+                        "filter": {
                             "operator": "status_is",
                             "property": "Status",
                             "propertyType": "status",
-                            "value": {{"type": "is_option", "value": "4 - Done"}}
-                        }}
-                    }},
-                    {{
-                        "filter": {{
+                            "value": {"type": "is_option", "value": "4 - Done"}
+                        }
+                    },
+                    {
+                        "filter": {
                             "operator": "is_empty",
                             "property": "Owner",
                             "propertyType": "person"
-                        }}
-                    }}
+                        }
+                    }
                 ]
-            }}"#
-        );
+            }"#;
         let view: ViewDef =
             serde_json::from_str(&view_json).expect("mixed-filter view should parse");
         let config = build_board_config(view, state).expect("should build config");

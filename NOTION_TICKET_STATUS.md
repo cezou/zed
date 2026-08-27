@@ -76,9 +76,21 @@ need `TicketRef::notion_page_uuid()` / `notion_client::extract_page_id(&record.u
 - Section label: `NO_SESSIONS_SECTION_LABEL = "No sessions"` (const, enum variant
   `TicketSectionKey::NoSessions`, and the `sidebar_tests.rs` expectation renamed with it).
 
+## Also on this branch: `script/winrun` and the `remote-build` skill are deleted
+
+At the user's request. Nothing on the Linux laptop is to drive builds on the desktop any more; work
+moves between machines through git only.
+
+**Follow-up needed when merging:** `CLAUDE.md` and `.rules` (both line ~140, "Running Zed in dev
+mode") still tell agents to "build it with the `remote-build` skill". That skill no longer exists, so
+the sentence needs rewriting to say the build happens on the desktop directly. Left untouched here on
+purpose — this fork's own rules hygiene section says not to edit `.rules` inline during feature work.
+
 ## Verification status
 
-Done on the Windows machine via `script/winrun` (never compiled on the Linux laptop):
+The code was checked earlier in the session, but **on the pre-rebase base**, and the equivalent runs
+were not repeated after rebasing onto `8239d30556`. Treat the results below as indicative, and
+re-run them on the desktop before trusting them:
 
 - `cargo check -p ticket_sync -p sidebar -p notion_client -p agent_ui -p ui` — clean.
 - `cargo clippy` on those five crates, `--all-targets` — no new warnings (the two remaining
@@ -86,12 +98,11 @@ Done on the Windows machine via `script/winrun` (never compiled on the Linux lap
   `useless_format` in a test).
 - `cargo test -p sidebar` — 150 passed. `cargo test -p notion_client -p agent_ui` — 438 + 33 passed.
 
-Note: whole-workspace `script/clippy` fails on the Windows machine for an unrelated reason —
-`wasmtime-c-api-impl`'s build script cannot find `cmake` (see `8239d30556`'s neighbour commit about
-the cmake the release build needs).
+Note: whole-workspace `script/clippy` failed for an unrelated reason — `wasmtime-c-api-impl`'s build
+script could not find `cmake`.
 
-**Not yet verified: the UI itself.** No GUI is reachable over SSH, so nothing here has been clicked.
-What to check from the Windows desktop with the `run-zed` skill:
+**Not verified at all: the UI itself.** Nothing here has been clicked. What to check from the Windows
+desktop with the `run-zed` skill:
 
 1. Click a ticket's status chip in the sidebar → the menu lists the 8 tracked statuses with the
    current one checked; the row must **not** expand/collapse from that click.

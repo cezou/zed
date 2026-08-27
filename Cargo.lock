@@ -18820,6 +18820,7 @@ dependencies = [
  "agent_ui",
  "anyhow",
  "chrono",
+ "collections",
  "db",
  "editor",
  "fs",

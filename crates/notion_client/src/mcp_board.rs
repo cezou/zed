@@ -505,6 +505,74 @@ pub async fn set_page_status(
     Ok(())
 }
 
+/// Looks tickets up by their page url, ignoring the board's status and
+/// assignee filters.
+///
+/// [`query_tickets`] can only ever return what the filter matches, so a ticket
+/// that moved to a status outside it — or was reassigned — silently stops being
+/// reported and its last-seen status would stand forever. This is how a ticket
+/// someone is still working in gets its real status back.
+pub async fn query_tickets_by_url(
+    client: &mut McpClient,
+    config: &McpBoardConfig,
+    urls: &[String],
+) -> Result<Vec<TicketRef>, McpError> {
+    if urls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", urls.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let issue_id_column = config
+        .issue_id_property
+        .as_deref()
+        .map(|property| format!(", \"{}\"", property.replace('"', "\"\"")))
+        .unwrap_or_default();
+    let query = format!(
+        "SELECT url, \"{title}\", \"{status}\"{issue_id_column} FROM \"{data_source}\" WHERE url IN ({placeholders})",
+        title = config.title_property,
+        status = config.status_property,
+        data_source = config.data_source_url,
+    );
+    let params: Vec<Value> = urls.iter().cloned().map(Value::String).collect();
+
+    let result = client
+        .call_tool(
+            "notion-query-data-sources",
+            json!({
+                "data": {
+                    "data_source_urls": [config.data_source_url],
+                    "query": query,
+                    "params": params,
+                }
+            }),
+        )
+        .await?;
+    if result.is_error {
+        return Err(McpError::Other(format!(
+            "notion-query-data-sources returned an error: {}",
+            result.joined_text()
+        )));
+    }
+    let payload = result.payload()?;
+    let envelope: QueryResultsEnvelope = serde_json::from_value(payload)
+        .map_err(|error| McpError::Other(format!("unexpected query result shape: {error}")))?;
+
+    Ok(envelope
+        .results
+        .iter()
+        .filter_map(|row| {
+            parse_row(
+                row,
+                &config.title_property,
+                &config.status_property,
+                config.issue_id_property.as_deref(),
+            )
+        })
+        .collect())
+}
+
 fn parse_row(
     row: &Value,
     title_property: &str,

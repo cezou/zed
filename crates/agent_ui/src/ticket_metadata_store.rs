@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use db::{
     sqlez::{
         bindable::Column, domain::Domain, statement::Statement,
@@ -149,9 +149,21 @@ impl TestTicketMetadataDbName {
     }
 }
 
+/// Where the Notion poll currently stands, so a row that only renders tickets
+/// can show a sync running (or failing) without depending on the crate that
+/// talks to Notion.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum TicketSyncState {
+    #[default]
+    Idle,
+    Syncing,
+    Failed(SharedString),
+}
+
 pub struct TicketMetadataStore {
     db: TicketMetadataDb,
     tickets: HashMap<TicketId, TicketWorktreeRecord>,
+    sync_state: TicketSyncState,
     /// Reverse index so a caller holding only a `TerminalId` (the sidebar
     /// deciding whether a terminal row belongs to a ticket) doesn't have to
     /// scan every ticket's sessions on every rebuild.
@@ -295,6 +307,51 @@ impl TicketMetadataStore {
     /// A board sync cannot supply the page body, so `body_markdown` and
     /// `body_fetched_at` are carried over from the existing record instead of
     /// being cleared on every sync.
+    pub fn sync_state(&self) -> &TicketSyncState {
+        &self.sync_state
+    }
+
+    pub fn set_sync_state(&mut self, state: TicketSyncState, cx: &mut Context<Self>) {
+        if self.sync_state == state {
+            return;
+        }
+        self.sync_state = state;
+        cx.notify();
+    }
+
+    /// Drops a ticket the Notion board no longer returns.
+    ///
+    /// Only ever called for a ticket with nothing of its own on disk — no
+    /// worktree, no sessions — because the board stops returning a ticket for
+    /// reasons that have nothing to do with the work: its status moved out of
+    /// the configured filter, or it was reassigned. A ticket someone is still
+    /// working in stays, with its status refreshed instead.
+    pub fn forget_ticket(&mut self, ticket_id: &TicketId, cx: &mut Context<Self>) {
+        if self.tickets.remove(ticket_id).is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The tickets the board no longer returns, split by whether they can be
+    /// dropped outright or still hold work and must have their real status
+    /// fetched instead.
+    pub fn tickets_missing_from(&self, returned: &HashSet<TicketId>) -> MissingTickets {
+        let mut missing = MissingTickets::default();
+        for (ticket_id, record) in &self.tickets {
+            if returned.contains(ticket_id) {
+                continue;
+            }
+            if record.worktree_path.is_none() && record.sessions.is_empty() {
+                missing.droppable.push(ticket_id.clone());
+            } else {
+                missing
+                    .still_working
+                    .push((ticket_id.clone(), record.url.to_string()));
+            }
+        }
+        missing
+    }
+
     pub fn upsert_ticket_ref(
         &mut self,
         ticket_id: TicketId,
@@ -568,6 +625,7 @@ impl TicketMetadataStore {
         let mut this = Self {
             db,
             tickets: HashMap::default(),
+            sync_state: TicketSyncState::default(),
             sessions_by_terminal: HashMap::default(),
             status_options: Vec::new(),
             pending_ops_tx: tx,
@@ -960,6 +1018,103 @@ async fn run_gtr_new(repo_path: &Path, branch_name: &str) -> anyhow::Result<Path
     let list = gtr_list(repo_path).await?;
     worktree_path_for_branch(&list, branch_name)
         .with_context(|| format!("git gtr list did not report a worktree for branch {branch_name}"))
+}
+
+/// What a ticket's worktree still holds that removing it would destroy, so the
+/// confirmation can say so before anything is deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorktreeWorkStatus {
+    pub dirty_files: usize,
+    pub unpushed_commits: usize,
+}
+
+impl WorktreeWorkStatus {
+    pub fn has_unsaved_work(&self) -> bool {
+        self.dirty_files > 0 || self.unpushed_commits > 0
+    }
+}
+
+/// Counts the uncommitted files and unpushed commits in `worktree_path`.
+///
+/// Every failure answers "nothing" rather than propagating: this only feeds a
+/// confirmation prompt, and a worktree whose directory is already gone, or
+/// whose branch has no upstream, must not block closing the ticket.
+pub async fn worktree_work_status(worktree_path: &Path) -> WorktreeWorkStatus {
+    let git = |args: &'static [&'static str]| async move {
+        let output = smol::process::Command::new("git")
+            .args(args)
+            .current_dir(worktree_path)
+            .output()
+            .await
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+
+    let dirty_files = git(&["status", "--porcelain"])
+        .await
+        .map(|output| output.lines().filter(|line| !line.is_empty()).count())
+        .unwrap_or_default();
+    let unpushed_commits = git(&["rev-list", "--count", "@{upstream}..HEAD"])
+        .await
+        .and_then(|output| output.trim().parse().ok())
+        .unwrap_or_default();
+
+    WorktreeWorkStatus {
+        dirty_files,
+        unpushed_commits,
+    }
+}
+
+/// Runs `git gtr rm <branch> --yes` in `repo_path`, the counterpart of the
+/// `git gtr new` that cut the worktree — so gtr's own pre/post-remove hooks run
+/// and its bookkeeping stays consistent.
+///
+/// `force` is what gtr needs to remove a worktree with uncommitted changes (and
+/// to override a failing hook), so it is only passed once the user has
+/// confirmed that second, louder prompt.
+pub async fn run_gtr_rm(
+    repo_path: &Path,
+    branch_name: &str,
+    delete_branch: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let mut args = vec!["gtr", "rm", branch_name, "--yes"];
+    if delete_branch {
+        args.push("--delete-branch");
+    }
+    if force {
+        args.push("--force");
+    }
+
+    let output = smol::process::Command::new("git")
+        .args(&args)
+        .current_dir(repo_path)
+        .output()
+        .await
+        .context("failed to run `git gtr` — is git-worktree-runner installed and on PATH?")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git gtr rm failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// The known tickets a board query did not return, split by what closing the
+/// gap costs: dropping a row, or one page fetch to learn its real status.
+#[derive(Debug, Default)]
+pub struct MissingTickets {
+    /// Tickets with no worktree and no sessions — nothing on disk depends on
+    /// them, so they simply leave the list.
+    pub droppable: Vec<TicketId>,
+    /// Tickets that still have a worktree or sessions, paired with their Notion
+    /// page url so their real status can be fetched.
+    pub still_working: Vec<(TicketId, String)>,
 }
 
 /// A worktree as `git gtr list --porcelain` reports it.
@@ -1870,6 +2025,86 @@ mod tests {
                 .map(|entry| entry.ticket_id.0.to_string())
                 .collect();
             assert_eq!(unranked, vec!["page-d", "page-e"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_worktree_work_status_answers_nothing_for_a_missing_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let status = cx
+            .background_executor
+            .spawn(async {
+                worktree_work_status(Path::new("/definitely-not-a-worktree-here")).await
+            })
+            .await;
+
+        assert_eq!(status, WorktreeWorkStatus::default());
+        assert!(
+            !status.has_unsaved_work(),
+            "a worktree that is already gone must not block closing its ticket"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tickets_missing_from_a_board_query_split_by_work_on_disk(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let untouched = TicketId::new("notion-page-untouched");
+        let with_worktree = TicketId::new("notion-page-with-worktree");
+        let still_returned = TicketId::new("notion-page-returned");
+        cx.update(|cx| {
+            TicketMetadataStore::global(cx).update(cx, |store, cx| {
+                for (ticket_id, url) in [
+                    (&untouched, "https://notion.so/untouched"),
+                    (&with_worktree, "https://notion.so/with-worktree"),
+                    (&still_returned, "https://notion.so/returned"),
+                ] {
+                    store.upsert_ticket_ref(
+                        ticket_id.clone(),
+                        display_fields("Ticket", url, Some("Waiting for customer")),
+                        cx,
+                    );
+                }
+                store
+                    .save_worktree(
+                        &with_worktree,
+                        PathBuf::from("/repo-feature"),
+                        "feature".to_string(),
+                        PathBuf::from("/repo"),
+                        None,
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TicketMetadataStore::global(cx);
+            let returned = HashSet::from_iter([still_returned.clone()]);
+            let missing = store.read(cx).tickets_missing_from(&returned);
+
+            assert_eq!(missing.droppable, vec![untouched.clone()]);
+            assert_eq!(
+                missing.still_working,
+                vec![(
+                    with_worktree.clone(),
+                    "https://notion.so/with-worktree".to_string()
+                )],
+                "a ticket with a worktree must be kept and re-queried, not dropped"
+            );
+
+            store.update(cx, |store, cx| {
+                for ticket_id in &missing.droppable {
+                    store.forget_ticket(ticket_id, cx);
+                }
+            });
+            let store = store.read(cx);
+            assert!(store.entry(&untouched).is_none());
+            assert!(store.entry(&with_worktree).is_some());
+            assert!(store.entry(&still_returned).is_some());
         });
     }
 

@@ -342,6 +342,15 @@ actions!(
     ]
 );
 
+actions!(
+    tickets,
+    [
+        /// Pulls the Notion board again right now instead of waiting for the
+        /// next poll, and reconciles tickets the board no longer returns.
+        SyncNotionTickets,
+    ]
+);
+
 /// Opens the launch modal for a Notion ticket: pick a repository, name the
 /// worktree, edit the brief, then start a Claude Code session.
 ///

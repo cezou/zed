@@ -11,8 +11,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 use agent_ui::ticket_metadata_store::{
-    TicketDisplayFields, TicketId, TicketMetadataStore, TicketWorktreeRecord,
+    TicketDisplayFields, TicketId, TicketMetadataStore, TicketSyncState, TicketWorktreeRecord,
 };
+use collections::HashSet;
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, Global, SharedString, Task, TaskExt as _,
     WeakEntity, Window, actions,
@@ -60,6 +61,11 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|_workspace, _: &ConnectToNotion, window, cx| {
             open_connect_to_notion_modal(window, cx);
+        });
+        workspace.register_action(|_workspace, _: &agent_ui::SyncNotionTickets, _window, cx| {
+            if let Some(service) = TicketSyncService::try_global(cx) {
+                service.update(cx, |service, cx| service.sync_now(cx));
+            }
         });
         workspace.register_action(
             |workspace, action: &agent_ui::StartTicketWork, window, cx| {
@@ -498,6 +504,13 @@ impl TicketSyncService {
         &self.status
     }
 
+    /// Restarts the poll right now. The refresh task is what owns the timer,
+    /// so replacing it is both the manual sync and a reset of the interval —
+    /// a sync the user just asked for makes the next scheduled one redundant.
+    pub fn sync_now(&mut self, cx: &mut Context<Self>) {
+        self.start_refresh(cx);
+    }
+
     fn new(cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             status: LoadStatus::NoToken,
@@ -580,6 +593,7 @@ async fn refresh_loop_rest(
 
     let client = NotionClient::new(http_client, token);
     loop {
+        set_sync_state(TicketSyncState::Syncing, cx);
         let result = client
             .query_tickets(&database_id, &schema, &assignee_user_id, &status_options)
             .await;
@@ -587,7 +601,10 @@ async fn refresh_loop_rest(
             .update(cx, |service, cx| {
                 match result {
                     Ok(tickets) => {
-                        upsert_tickets_into_store(&tickets, cx);
+                        let returned = upsert_tickets_into_store(&tickets, cx);
+                        // Nothing to re-query the dropped-out tickets with over
+                        // REST, so they keep their last-seen status.
+                        drop_missing_tickets(&returned, cx);
                         service.status = LoadStatus::Loaded;
                     }
                     Err(error) => {
@@ -597,6 +614,7 @@ async fn refresh_loop_rest(
                 cx.notify();
             })
             .is_ok();
+        publish_sync_state(&service, cx);
         if !updated {
             break;
         }
@@ -645,12 +663,38 @@ async fn refresh_loop_mcp(
     };
 
     loop {
+        set_sync_state(TicketSyncState::Syncing, cx);
         let mut client = McpClient::new(http_client.clone(), tokens.clone());
         let result = async {
             client.initialize().await?;
             notion_client::mcp_board::query_tickets(&mut client, &config, &person_id).await
         }
         .await;
+
+        // A ticket the board no longer returns still needs its real status when
+        // work is in flight on it, and this is the only place holding a client
+        // to ask with. A failure here leaves the stale status standing rather
+        // than failing the whole sync.
+        if let Ok(tickets) = &result {
+            let still_working = cx.update(|cx| {
+                let returned = upsert_tickets_into_store(tickets, cx);
+                drop_missing_tickets(&returned, cx)
+            });
+            if !still_working.is_empty() {
+                let urls: Vec<String> = still_working.into_iter().map(|(_, url)| url).collect();
+                match notion_client::mcp_board::query_tickets_by_url(&mut client, &config, &urls)
+                    .await
+                {
+                    Ok(refreshed) => {
+                        cx.update(|cx| upsert_tickets_into_store(&refreshed, cx));
+                    }
+                    Err(error) => log::warn!(
+                        "failed to refresh the status of tickets the board no longer returns: {error}"
+                    ),
+                }
+            }
+        }
+
         if let Some(refreshed) = client.refreshed_tokens() {
             tokens = refreshed.clone();
             let store_task = cx.update(|cx| oauth_store::store_tokens(&tokens, cx));
@@ -660,8 +704,7 @@ async fn refresh_loop_mcp(
         let updated = service
             .update(cx, |service, cx| {
                 match result {
-                    Ok(tickets) => {
-                        upsert_tickets_into_store(&tickets, cx);
+                    Ok(_) => {
                         service.status = LoadStatus::Loaded;
                     }
                     Err(error) => {
@@ -671,6 +714,7 @@ async fn refresh_loop_mcp(
                 cx.notify();
             })
             .is_ok();
+        publish_sync_state(&service, cx);
         if !updated {
             break;
         }
@@ -693,11 +737,37 @@ fn publish_status_options(settings: &TicketSyncSettings, cx: &mut App) {
     store.update(cx, |store, cx| store.set_status_options(options, cx));
 }
 
-fn upsert_tickets_into_store(tickets: &[TicketRef], cx: &mut App) {
+/// Mirrors the poll's state onto the ticket store, which is what the sidebar
+/// observes — it renders the rows but must not depend on this crate.
+fn set_sync_state(state: TicketSyncState, cx: &mut AsyncApp) {
+    cx.update(|cx| {
+        if let Some(store) = TicketMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| store.set_sync_state(state, cx));
+        }
+    });
+}
+
+/// Publishes the outcome of the poll that just finished.
+fn publish_sync_state(service: &WeakEntity<TicketSyncService>, cx: &mut AsyncApp) {
+    let state = service
+        .read_with(cx, |service, _cx| match service.status() {
+            LoadStatus::Error(error) => TicketSyncState::Failed(error.clone()),
+            _ => TicketSyncState::Idle,
+        })
+        .unwrap_or(TicketSyncState::Idle);
+    set_sync_state(state, cx);
+}
+
+/// Folds a query's results into the store and reports which tickets it covered,
+/// so the caller can tell what a *board* query left out.
+fn upsert_tickets_into_store(tickets: &[TicketRef], cx: &mut App) -> HashSet<TicketId> {
+    let mut returned = HashSet::default();
     let Some(store) = TicketMetadataStore::try_global(cx) else {
-        return;
+        return returned;
     };
     for ticket in tickets {
+        let ticket_id = TicketId::new(ticket.page_id.clone());
+        returned.insert(ticket_id.clone());
         let fields = TicketDisplayFields {
             title: ticket.title.clone().into(),
             url: ticket.url.clone().into(),
@@ -706,9 +776,31 @@ fn upsert_tickets_into_store(tickets: &[TicketRef], cx: &mut App) {
             issue_id: ticket.issue_id.as_deref().and_then(non_empty),
         };
         store.update(cx, |store, cx| {
-            store.upsert_ticket_ref(TicketId::new(ticket.page_id.clone()), fields.clone(), cx);
+            store.upsert_ticket_ref(ticket_id.clone(), fields.clone(), cx);
         });
     }
+    returned
+}
+
+/// Closes the gap a board query leaves behind: it filters on status and
+/// assignee, so a ticket that moves to a status outside the filter — or is
+/// handed to someone else — simply stops being returned, and its row would
+/// otherwise keep its last-seen status forever.
+///
+/// Tickets with nothing on disk are dropped outright. Those still holding a
+/// worktree or sessions are kept and returned with their page url, so the
+/// caller can ask Notion what their status actually is now.
+fn drop_missing_tickets(returned: &HashSet<TicketId>, cx: &mut App) -> Vec<(TicketId, String)> {
+    let Some(store) = TicketMetadataStore::try_global(cx) else {
+        return Vec::new();
+    };
+    let missing = store.read(cx).tickets_missing_from(returned);
+    store.update(cx, |store, cx| {
+        for ticket_id in &missing.droppable {
+            store.forget_ticket(ticket_id, cx);
+        }
+    });
+    missing.still_working
 }
 
 /// Notion's board query reports a missing text property as an empty string;

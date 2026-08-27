@@ -15359,7 +15359,7 @@ async fn test_ticket_for_unopened_repo_gets_its_own_section(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-async fn test_ticket_without_worktree_lands_in_ready_for_dev(cx: &mut TestAppContext) {
+async fn test_ticket_without_worktree_lands_in_no_sessions_section(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));

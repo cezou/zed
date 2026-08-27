@@ -440,6 +440,30 @@ impl NotionClient {
         Ok(tickets)
     }
 
+    /// Writes a new value into a ticket page's status property.
+    ///
+    /// `page_id` must be the page's UUID (see [`TicketRef::notion_page_uuid`]).
+    pub async fn set_ticket_status(
+        &self,
+        page_id: &str,
+        status_property: &str,
+        status_property_kind: StatusPropertyKind,
+        status: &str,
+    ) -> Result<(), NotionError> {
+        let status_key = match status_property_kind {
+            StatusPropertyKind::Status => "status",
+            StatusPropertyKind::Select => "select",
+        };
+        let body = json!({
+            "properties": {
+                status_property: { status_key: { "name": status } }
+            }
+        });
+        self.request(Method::PATCH, &format!("/pages/{page_id}"), Some(body))
+            .await?;
+        Ok(())
+    }
+
     /// Runs [`Self::query_tickets`] once and reports the result via
     /// `on_result`. Single call, no scheduling — see [`refresh_loop`] for a
     /// recurring background refresh.
@@ -624,9 +648,80 @@ pub fn extract_page_id(input: &str) -> String {
     )
 }
 
+/// Notion's query engine hands a row's web URL back as
+/// `https://app.notion.com/<id>` on some workspaces, and Notion resolves
+/// neither that shape nor a bare id — only `/p/<id>` — so it is rewritten
+/// here. Every other shape (an already-`/p/` link, or a
+/// `notion.so/<workspace>/<Title>-<id>` one) is left alone, both because it
+/// works and because its slug keeps the title readable wherever the URL is
+/// shown to a human.
+pub fn normalize_page_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+    let mut segments = parsed
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty());
+    let (Some(only_segment), None) = (segments.next(), segments.next()) else {
+        return trimmed.to_string();
+    };
+
+    let id: String = only_segment.chars().filter(|ch| *ch != '-').collect();
+    if id.len() != 32 || !id.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return trimmed.to_string();
+    }
+
+    match parsed.fragment() {
+        Some(fragment) => format!("https://app.notion.com/p/{id}#{fragment}"),
+        None => format!("https://app.notion.com/p/{id}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_page_url_rewrites_a_bare_id_path() {
+        assert_eq!(
+            normalize_page_url("https://app.notion.com/0123456789abcdef0123456789abcdef"),
+            "https://app.notion.com/p/0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn normalize_page_url_keeps_a_block_fragment() {
+        assert_eq!(
+            normalize_page_url(
+                "https://app.notion.com/0123456789abcdef0123456789abcdef#abcdef"
+            ),
+            "https://app.notion.com/p/0123456789abcdef0123456789abcdef#abcdef"
+        );
+    }
+
+    #[test]
+    fn normalize_page_url_leaves_a_p_link_alone() {
+        let url = "https://app.notion.com/p/0123456789abcdef0123456789abcdef";
+        assert_eq!(normalize_page_url(url), url);
+    }
+
+    #[test]
+    fn normalize_page_url_leaves_a_slugged_url_alone() {
+        let url = "https://www.notion.so/acme/Fix-The-Thing-0123456789abcdef0123456789abcdef";
+        assert_eq!(normalize_page_url(url), url);
+    }
+
+    #[test]
+    fn normalize_page_url_passes_through_anything_without_an_id() {
+        assert_eq!(
+            normalize_page_url("https://app.notion.com/login"),
+            "https://app.notion.com/login"
+        );
+        assert_eq!(normalize_page_url("not a url"), "not a url");
+    }
 
     #[test]
     fn extract_page_id_from_a_slugged_url() {

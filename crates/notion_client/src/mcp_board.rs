@@ -475,14 +475,48 @@ pub async fn query_tickets(
         .collect())
 }
 
+/// Writes a new value into the board's status property for one page.
+///
+/// `page_uuid` must be the page's real UUID: on this path
+/// [`TicketRef::page_id`] is the URL's slug-plus-id segment, which
+/// `notion-update-page` rejects — use [`TicketRef::notion_page_uuid`].
+pub async fn set_page_status(
+    client: &mut McpClient,
+    page_uuid: &str,
+    status_property: &str,
+    status: &str,
+) -> Result<(), McpError> {
+    let result = client
+        .call_tool(
+            "notion-update-page",
+            json!({
+                "page_id": page_uuid,
+                "command": "update_properties",
+                "properties": { status_property: status },
+            }),
+        )
+        .await?;
+    if result.is_error {
+        return Err(McpError::Other(format!(
+            "notion-update-page returned an error: {}",
+            result.joined_text()
+        )));
+    }
+    Ok(())
+}
+
 fn parse_row(
     row: &Value,
     title_property: &str,
     status_property: &str,
     issue_id_property: Option<&str>,
 ) -> Option<TicketRef> {
-    let url = row.get("url").and_then(Value::as_str)?.to_string();
-    let page_id = url.rsplit('/').next().unwrap_or(&url).to_string();
+    let raw_url = row.get("url").and_then(Value::as_str)?;
+    // Derived from the *raw* url: this is the primary key of the on-disk
+    // ticket store (see `TicketRef::notion_page_uuid`), so normalizing the
+    // url must not shift it.
+    let page_id = raw_url.rsplit('/').next().unwrap_or(raw_url).to_string();
+    let url = crate::normalize_page_url(raw_url);
     let title = row
         .get(title_property)
         .and_then(Value::as_str)
@@ -679,6 +713,21 @@ mod tests {
             ticket.notion_page_uuid(),
             "00000000-0000-0000-0000-000000000000"
         );
+    }
+
+    #[test]
+    fn query_result_row_repairs_a_bare_id_url() {
+        let row = serde_json::json!({
+            "url": "https://app.notion.com/00000000000000000000000000000000",
+            "Task": "Fake Ticket Title",
+            "Status": "2 - Doing"
+        });
+        let ticket = parse_row(&row, "Task", "Status", None).expect("row should parse");
+        assert_eq!(
+            ticket.url,
+            "https://app.notion.com/p/00000000000000000000000000000000"
+        );
+        assert_eq!(ticket.page_id, "00000000000000000000000000000000");
     }
 
     #[test]

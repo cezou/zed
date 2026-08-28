@@ -73,6 +73,39 @@ So a restore checks for the transcript first (`claude_transcript_exists_in`) and
 falls back to Claude's own picker when it is missing, rather than dropping the
 user into a terminal that can only print that error.
 
+### Sessions live in the workspace center
+
+A session's terminal is an item of the workspace's center pane group, not of the
+agent panel's dock, and launching one closes that dock. The center is the flex
+between the docks, so the session fills the frame beside the git panel with no
+empty gap in between — and, being in a real `Pane`, it gets Zed's splitting,
+tab bar, search bar and pane navigation for free.
+
+The agent panel stays the registry: it owns `AgentTerminal` (Claude liveness,
+bell, titles, `cc_session_id`) and still respawns sessions with
+`claude --resume`. Only the display surface moved. `AgentTerminal::host` records
+which of the two a terminal uses.
+
+An additional session splits the ticket's live session instead of replacing it,
+in the direction given by `agent.session_split_direction` (default `right`).
+Shortcuts, bound to `Terminal && TicketSession`:
+
+| Shortcut | Effect |
+| --- | --- |
+| `ctrl-alt-<arrow>` | one more Claude Code session for the same ticket |
+| `ctrl-alt-shift-<arrow>` | a bare shell in the same worktree (`clone_on_split`) |
+
+`ctrl-k <arrow>` is unbound there on purpose: `Pane` binds it as a multi-key
+prefix, which would swallow readline's kill-line inside Claude's own prompt.
+
+Closing a session's tab detaches it — the `TicketSessionRecord` survives, so it
+stays in the sidebar and `claude --resume` can pick it up. `TerminalView` opts
+out of the workspace's own item serialization
+(`SerializableItem::included_in_workspace_serialization`) when it is a session:
+otherwise a restart would rebuild it as a bare shell next to the real session
+the agent panel restores. Sessions other than the last active one are restored
+lazily, when their sidebar row is clicked.
+
 ### `agent.show_zed_agent_threads`
 
 Defaults to `false` and hides Zed's own agent threads from the sidebar, leaving

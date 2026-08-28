@@ -10065,7 +10065,10 @@ fn serialize_pane_handle(
             .items()
             .enumerate()
             .filter_map(|(index, handle)| {
-                let Some(handle) = handle.to_serializable_item_handle(cx) else {
+                let Some(handle) = handle
+                    .to_serializable_item_handle(cx)
+                    .filter(|handle| handle.included_in_workspace_serialization(cx))
+                else {
                     if pinned_region.contains(&index) {
                         pinned_count -= 1;
                     }

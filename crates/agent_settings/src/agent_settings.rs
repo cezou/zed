@@ -17,9 +17,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, SessionSplitDirection,
+    Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
+    ThinkingBlockDisplay, ToolPermissionMode, update_settings_file,
+    update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -209,6 +210,7 @@ pub struct AgentSettings {
     pub flexible: bool,
     pub sidebar_side: SidebarDockPosition,
     pub show_zed_agent_threads: bool,
+    pub session_split_direction: SessionSplitDirection,
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
@@ -761,6 +763,7 @@ impl Settings for AgentSettings {
             dock: agent.dock.unwrap(),
             sidebar_side: agent.sidebar_side.unwrap(),
             show_zed_agent_threads: agent.show_zed_agent_threads.unwrap(),
+            session_split_direction: agent.session_split_direction.unwrap(),
             default_width: agent.default_width.unwrap().into_gpui(),
             default_height: agent.default_height.unwrap().into_gpui(),
             max_content_width: if agent.limit_content_width.unwrap() {

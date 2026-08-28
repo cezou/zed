@@ -434,6 +434,15 @@ pub trait SerializableItem: Item {
     ) -> Option<Task<Result<()>>>;
 
     fn should_serialize(&self, event: &Self::Event) -> bool;
+
+    /// Whether the workspace's own pane serialization should list this item.
+    /// An item whose restore is driven by something else opts out, so a restart
+    /// does not rebuild it twice — the case being a Claude Code session, which
+    /// the agent panel respawns with `claude --resume` from its own records,
+    /// and which the generic terminal restore would replace with a bare shell.
+    fn included_in_workspace_serialization(&self, _cx: &App) -> bool {
+        true
+    }
 }
 
 pub trait SerializableItemHandle: ItemHandle {
@@ -446,6 +455,7 @@ pub trait SerializableItemHandle: ItemHandle {
         cx: &mut App,
     ) -> Option<Task<Result<()>>>;
     fn should_serialize(&self, event: &dyn Any, cx: &App) -> bool;
+    fn included_in_workspace_serialization(&self, cx: &App) -> bool;
 }
 
 impl<T> SerializableItemHandle for Entity<T>
@@ -472,6 +482,10 @@ where
         event
             .downcast_ref::<T::Event>()
             .is_some_and(|event| self.read(cx).should_serialize(event))
+    }
+
+    fn included_in_workspace_serialization(&self, cx: &App) -> bool {
+        self.read(cx).included_in_workspace_serialization(cx)
     }
 }
 

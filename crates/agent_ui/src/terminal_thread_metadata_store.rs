@@ -155,6 +155,115 @@ pub fn claude_task_summary(terminal_title: &str) -> Option<&str> {
     (!summary.is_empty() && summary != CLAUDE_PLACEHOLDER_TASK).then_some(summary)
 }
 
+/// How many lines of terminal output to hand [`claude_response_excerpt`].
+///
+/// Enough to reach back over a tool call and its result to the prose above it,
+/// without scanning a whole screenful for nothing.
+pub const CLAUDE_EXCERPT_LINES: usize = 40;
+
+/// How much of the response to carry into a notification body. Both XDG and
+/// Windows truncate long bodies themselves, at lengths neither documents, so
+/// the cut is made here where it can land on a word boundary.
+const CLAUDE_EXCERPT_MAX_CHARS: usize = 200;
+
+/// The glyphs Claude Code prefixes its own messages and its tool calls with.
+const CLAUDE_MESSAGE_MARKERS: [char; 2] = ['\u{23fa}', '\u{25cf}'];
+
+/// The last thing Claude Code said, recovered from what it drew on screen.
+///
+/// The transcript on disk would be a more faithful source, but its location and
+/// shape are Claude Code's private business, whereas the screen is the contract
+/// it keeps with the user. So this reads the rendered output: every message and
+/// every tool call is prefixed with a marker glyph, and the input box below them
+/// is drawn with box-drawing characters. Walking backwards to the last marker
+/// that is not a tool call, then forward to the first line of box drawing,
+/// yields the prose Claude finished on.
+///
+/// This is a heuristic over a TUI that is free to change, so callers must have
+/// something to fall back on: `None` means "nothing recognizable", not "nothing
+/// happened".
+///
+/// Expects the output of `terminal::Terminal::last_n_non_empty_lines`, which
+/// unwraps soft-wrapped rows into one logical line each and drops blank lines.
+pub fn claude_response_excerpt(lines: &[String]) -> Option<String> {
+    let message_start = lines.iter().enumerate().rev().find_map(|(index, line)| {
+        let message = strip_message_marker(line)?;
+        (!is_tool_call(message)).then_some(index)
+    })?;
+
+    let mut excerpt = String::new();
+    for line in lines.get(message_start..)? {
+        let text = match strip_message_marker(line) {
+            Some(message) if excerpt.is_empty() => message,
+            // A further marker opens the next message or a tool call, so the
+            // message being read ends here.
+            Some(_) => break,
+            None if is_chrome(line) => break,
+            None => line.trim(),
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if !excerpt.is_empty() {
+            excerpt.push(' ');
+        }
+        excerpt.push_str(text);
+    }
+
+    let excerpt = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!excerpt.is_empty()).then(|| truncate_on_word_boundary(&excerpt, CLAUDE_EXCERPT_MAX_CHARS))
+}
+
+/// The text after a message or tool-call marker, or `None` if the line carries
+/// no marker.
+fn strip_message_marker(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let marker = line.chars().next()?;
+    if !CLAUDE_MESSAGE_MARKERS.contains(&marker) {
+        return None;
+    }
+    Some(line[marker.len_utf8()..].trim_start())
+}
+
+/// Whether a marked line is a tool call (`Bash(cargo test)`) rather than prose.
+fn is_tool_call(message: &str) -> bool {
+    let name_length = message
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .count();
+    name_length > 0
+        && message
+            .get(name_length..)
+            .is_some_and(|rest| rest.starts_with('('))
+}
+
+/// Whether a line belongs to Claude Code's frame rather than its output: the
+/// input box, a tool result's hook, the mode indicators, the status glyph.
+fn is_chrome(line: &str) -> bool {
+    let Some(first) = line.trim_start().chars().next() else {
+        return true;
+    };
+    matches!(first, '\u{2500}'..='\u{257f}' | '\u{23b8}'..='\u{23bf}' | '\u{23f4}'..='\u{23f7}')
+        || CLAUDE_WORKING_GLYPHS.contains(&first)
+        || CLAUDE_IDLE_GLYPHS.contains(&first)
+}
+
+fn truncate_on_word_boundary(text: &str, max_characters: usize) -> String {
+    if text.chars().count() <= max_characters {
+        return text.to_string();
+    }
+    let cut = text
+        .char_indices()
+        .nth(max_characters)
+        .map_or(text.len(), |(index, _)| index);
+    let head = &text[..cut];
+    // A word longer than the whole budget has no boundary to fall back on.
+    let head = head
+        .rfind(char::is_whitespace)
+        .map_or(head, |space| &head[..space]);
+    format!("{}\u{2026}", head.trim_end())
+}
+
 pub fn terminal_title_prefix(title: &str) -> Option<&str> {
     let mut prefix_byte_len = 0;
     let mut saw_prefix_character = false;
@@ -756,6 +865,97 @@ mod tests {
         // Before the first prompt of a session there is no task to report.
         assert_eq!(claude_task_summary("✳ Claude Code"), None);
         assert_eq!(claude_task_summary("zsh"), None);
+    }
+
+    /// The screen Claude Code leaves behind after a turn, as
+    /// `last_n_non_empty_lines` reports it: blank lines dropped, soft wraps
+    /// already joined. `\u{23fa}` is the message marker, `\u{23bf}` the tool
+    /// result hook, and the box drawing is the input prompt below the output.
+    fn screen(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn test_claude_response_excerpt_reads_the_last_message() {
+        let lines = screen(&[
+            "\u{23fa} Bash(cargo test -p agent_ui)",
+            "  \u{23bf}  running 12 tests",
+            "\u{23fa} The twelve tests pass.",
+            "  Nothing else needed changing.",
+            "\u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}",
+            "\u{2502} > \u{2502}",
+            "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
+            "  ? for shortcuts",
+        ]);
+        assert_eq!(
+            claude_response_excerpt(&lines).as_deref(),
+            Some("The twelve tests pass. Nothing else needed changing.")
+        );
+    }
+
+    #[test]
+    fn test_claude_response_excerpt_walks_back_over_a_trailing_tool_call() {
+        // A turn that ended on a tool call still has prose above it, which is
+        // what the user needs to read.
+        let lines = screen(&[
+            "\u{23fa} I will check the worktree state first.",
+            "\u{23fa} Bash(git status --porcelain)",
+            "  \u{23bf}  (No content)",
+            "\u{2502} > \u{2502}",
+        ]);
+        assert_eq!(
+            claude_response_excerpt(&lines).as_deref(),
+            Some("I will check the worktree state first.")
+        );
+    }
+
+    #[test]
+    fn test_claude_response_excerpt_ignores_a_screen_with_no_message() {
+        // A prompt waiting for its first instruction, and a plain shell.
+        assert_eq!(
+            claude_response_excerpt(&screen(&[
+                "\u{2502} > \u{2502}",
+                "  ? for shortcuts",
+                "\u{2733} Claude Code",
+            ])),
+            None
+        );
+        assert_eq!(
+            claude_response_excerpt(&screen(&["~/src/zed", "zsh"])),
+            None
+        );
+        assert_eq!(claude_response_excerpt(&[]), None);
+    }
+
+    #[test]
+    fn test_claude_response_excerpt_truncates_on_a_word_boundary() {
+        let sentence = "mot ".repeat(CLAUDE_EXCERPT_MAX_CHARS);
+        let excerpt = claude_response_excerpt(&screen(&[&format!("\u{23fa} {sentence}")]))
+            .expect("the marked line carries prose");
+        assert!(excerpt.ends_with("mot\u{2026}"), "{excerpt}");
+        assert!(
+            excerpt.chars().count() <= CLAUDE_EXCERPT_MAX_CHARS + 1,
+            "{} characters",
+            excerpt.chars().count()
+        );
+
+        // A word longer than the budget has no boundary to cut on, so it is
+        // cut at the budget rather than carried whole.
+        let long_word = "s".repeat(CLAUDE_EXCERPT_MAX_CHARS + 20);
+        let expected = format!("{}\u{2026}", "s".repeat(CLAUDE_EXCERPT_MAX_CHARS));
+        assert_eq!(
+            claude_response_excerpt(&screen(&[&format!("\u{23fa} {long_word}")])).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn test_is_tool_call_separates_calls_from_prose() {
+        assert!(is_tool_call("Bash(cargo test)"));
+        assert!(is_tool_call("Read(crates/agent_ui/src/agent_panel.rs)"));
+        assert!(!is_tool_call("The build (finally) passes."));
+        assert!(!is_tool_call("(No content)"));
+        assert!(!is_tool_call(""));
     }
 
     #[test]

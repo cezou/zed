@@ -58,10 +58,20 @@ A session is started as:
 claude --session-id <uuid> --permission-mode plan "Read .zed-ticket/brief.md and start working on it."
 ```
 
-Because the session id is chosen by Zed rather than by Claude, a recorded
-session can always be resumed with `claude --resume <id>` — which is why
-sessions survive a reboot. Session records live in `TicketMetadataStore`
-alongside the ticket.
+The session id is chosen by Zed rather than by Claude, so a session Zed launched
+can be resumed with `claude --resume <id>`. Session records live in
+`TicketMetadataStore` alongside the ticket.
+
+That id alone is **not** a guarantee, though. Claude only writes its transcript
+(`~/.claude/projects/<encoded-cwd>/<id>.jsonl`) once a turn has actually reached
+the model — not at startup. A session that launched but never got a turn, which
+happens when the typed launch command does not land (see
+`write_terminal_init_command`), leaves no transcript at all, and
+`claude --resume <id>` then fails for good with "No conversation found".
+
+So a restore checks for the transcript first (`claude_transcript_exists_in`) and
+falls back to Claude's own picker when it is missing, rather than dropping the
+user into a terminal that can only print that error.
 
 ### `agent.show_zed_agent_threads`
 

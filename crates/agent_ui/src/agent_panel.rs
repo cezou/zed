@@ -1,7 +1,7 @@
 use std::{
     cell::Cell,
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc,
@@ -285,6 +285,93 @@ pub fn terminal_resume_command(metadata: &TerminalThreadMetadata) -> Option<Stri
         .as_deref()
         .filter(|command| *command == CLAUDE_RESUME_COMMAND)
         .map(str::to_string)
+}
+
+/// Where Claude Code keeps its transcripts.
+///
+/// `CLAUDE_CONFIG_DIR` overrides the default `~/.claude`, matching the CLI.
+fn claude_projects_dir() -> PathBuf {
+    let config_dir = match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => util::paths::home_dir().join(".claude"),
+    };
+    config_dir.join("projects")
+}
+
+/// Whether Claude Code actually has a transcript for `cc_session_id`.
+///
+/// A session id minted by Zed only becomes resumable once a turn has reached
+/// the model: Claude writes `<projects>/<encoded-cwd>/<id>.jsonl` at that
+/// point, not at startup. A session that was launched but never used therefore
+/// leaves nothing behind, and `claude --resume <id>` fails outright with "No
+/// conversation found".
+///
+/// Every project directory is scanned rather than deriving the encoded cwd,
+/// because `--resume` itself locates a session from any directory, and the cwd
+/// Zed recorded is not necessarily the one Claude encoded.
+async fn claude_transcript_exists_in(
+    fs: &Arc<dyn Fs>,
+    projects_dir: &Path,
+    cc_session_id: &str,
+) -> bool {
+    let transcript_name = format!("{cc_session_id}.jsonl");
+    let Ok(mut projects) = fs.read_dir(projects_dir).await else {
+        return false;
+    };
+    while let Some(project) = futures::StreamExt::next(&mut projects).await {
+        let Ok(project) = project else {
+            continue;
+        };
+        let Ok(mut transcripts) = fs.read_dir(&project).await else {
+            continue;
+        };
+        while let Some(transcript) = futures::StreamExt::next(&mut transcripts).await {
+            let Ok(transcript) = transcript else {
+                continue;
+            };
+            if transcript
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy() == transcript_name)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The command a restored ticket terminal should actually run.
+///
+/// Falls back to Claude's own picker when the recorded session id has no
+/// transcript, which would otherwise leave the user staring at "No
+/// conversation found" in a terminal they cannot do anything with.
+async fn resolved_terminal_resume_command(
+    fs: &Arc<dyn Fs>,
+    metadata: &TerminalThreadMetadata,
+) -> Option<String> {
+    let projects_dir = claude_projects_dir();
+    resolved_terminal_resume_command_in(fs, Some(&projects_dir), metadata).await
+}
+
+async fn resolved_terminal_resume_command_in(
+    fs: &Arc<dyn Fs>,
+    projects_dir: Option<&Path>,
+    metadata: &TerminalThreadMetadata,
+) -> Option<String> {
+    let command = terminal_resume_command(metadata)?;
+    let Some(cc_session_id) = metadata.cc_session_id.as_deref() else {
+        return Some(command);
+    };
+    if let Some(projects_dir) = projects_dir
+        && claude_transcript_exists_in(fs, projects_dir, cc_session_id).await
+    {
+        return Some(command);
+    }
+    log::warn!(
+        "claude session {cc_session_id} has no transcript, so it cannot be resumed by id; \
+         falling back to claude's session picker"
+    );
+    Some(CLAUDE_RESUME_COMMAND.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -2296,8 +2383,13 @@ impl AgentPanel {
             let input = Self::terminal_init_command_input(command);
             if let Err(error) = terminal.update(cx, move |terminal, cx| {
                 if !terminal.write_init_command_after_startup(input, cx) {
-                    log::debug!(
-                        "skipping terminal init command because the terminal is no longer eligible"
+                    // Warn, not debug: for a ticket session this is the launch
+                    // command never reaching `claude`, which leaves an idle
+                    // shell that looks like a running session and a session id
+                    // that will never be resumable.
+                    log::warn!(
+                        "terminal init command was not sent: the terminal already had \
+                         keyboard input or its child exited"
                     );
                 }
             }) {
@@ -2610,22 +2702,32 @@ impl AgentPanel {
         // Only a terminal that was previously launched as a `claude` session
         // gets a resume command on respawn; a plain agent-panel terminal
         // restore continues to open a blank shell exactly as before.
-        let resume_command = terminal_resume_command(&metadata);
-        self.spawn_terminal(
-            metadata.terminal_id,
-            working_directory,
-            metadata.custom_title.clone(),
-            initial_title,
-            Some(metadata.created_at),
-            resume_command,
-            metadata.cc_session_id,
-            true,
-            focus,
-            true,
-            source,
-            window,
-            cx,
-        );
+        //
+        // Resolving it needs to look at the filesystem, so the spawn happens on
+        // the other side of that await. `pending_terminal_spawn` is already set,
+        // which is what keeps a second restore from racing this one.
+        let fs = <dyn Fs>::global(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let resume_command = resolved_terminal_resume_command(&fs, &metadata).await;
+            this.update_in(cx, |this, window, cx| {
+                this.spawn_terminal(
+                    metadata.terminal_id,
+                    working_directory,
+                    metadata.custom_title.clone(),
+                    initial_title,
+                    Some(metadata.created_at),
+                    resume_command,
+                    metadata.cc_session_id,
+                    true,
+                    focus,
+                    true,
+                    source,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn restore_terminal_for_panel_load(
@@ -7200,6 +7302,102 @@ mod tests {
         assert_eq!(
             terminal_resume_command(&metadata(Some("cargo run"), None)),
             None
+        );
+    }
+
+    fn resume_test_metadata(cc_session_id: Option<&str>) -> TerminalThreadMetadata {
+        TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "claude".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::default(),
+            remote_connection: None,
+            working_directory: None,
+            initial_command: Some("claude --session-id abc --permission-mode plan 'go'".into()),
+            cc_session_id: cc_session_id.map(str::to_string),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_a_session_without_a_transcript_falls_back_to_the_picker(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        // Claude only writes the transcript once a turn reached the model, so a
+        // session that was launched but never used leaves this tree empty — and
+        // `claude --resume <id>` would answer "No conversation found".
+        fs.insert_tree(
+            "/claude",
+            json!({ "projects": { "-some-other-project": {} } }),
+        )
+        .await;
+        let fs: Arc<dyn Fs> = fs;
+
+        assert!(
+            !claude_transcript_exists_in(&fs, Path::new("/claude/projects"), "abc").await,
+            "a session id with no .jsonl anywhere must not count as resumable"
+        );
+        assert_eq!(
+            resolved_terminal_resume_command_in(
+                &fs,
+                Some(Path::new("/claude/projects")),
+                &resume_test_metadata(Some("abc"))
+            )
+            .await
+            .as_deref(),
+            Some("claude --resume"),
+            "an unresumable id should hand over to claude's own picker"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_session_with_a_transcript_resumes_by_id(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        // The transcript lives under the encoded cwd, which is not necessarily
+        // the directory Zed recorded, so the lookup scans every project.
+        fs.insert_tree(
+            "/claude",
+            json!({
+                "projects": {
+                    "-some-other-project": { "zzz.jsonl": "" },
+                    "-home-user-worktree": { "abc.jsonl": "{}" },
+                }
+            }),
+        )
+        .await;
+        let fs: Arc<dyn Fs> = fs;
+
+        assert!(claude_transcript_exists_in(&fs, Path::new("/claude/projects"), "abc").await);
+        assert_eq!(
+            resolved_terminal_resume_command_in(
+                &fs,
+                Some(Path::new("/claude/projects")),
+                &resume_test_metadata(Some("abc"))
+            )
+            .await
+            .as_deref(),
+            Some("claude --resume abc")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_picker_session_is_left_alone(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/claude", json!({ "projects": {} })).await;
+        let fs: Arc<dyn Fs> = fs;
+
+        // No id of its own: there is nothing to look up, and the picker command
+        // must survive untouched.
+        let mut metadata = resume_test_metadata(None);
+        metadata.initial_command = Some(CLAUDE_RESUME_COMMAND.to_string());
+        assert_eq!(
+            resolved_terminal_resume_command_in(
+                &fs,
+                Some(Path::new("/claude/projects")),
+                &metadata
+            )
+            .await
+            .as_deref(),
+            Some("claude --resume")
         );
     }
 

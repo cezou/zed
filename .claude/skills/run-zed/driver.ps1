@@ -104,8 +104,25 @@ function Build-Zed {
     }
 }
 
+function Get-TargetDir {
+    # Not hardcoded to <repo>\target: a shared build cache (cargo's
+    # build.target-dir) puts the binary outside the checkout, and every git
+    # worktree then shares one directory. Ask cargo where it actually writes.
+    Push-Location $RepoRoot
+    try {
+        $metadata = cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json
+        if ($metadata -and $metadata.target_directory) {
+            return $metadata.target_directory
+        }
+    } catch {
+    } finally {
+        Pop-Location
+    }
+    return (Join-Path $RepoRoot 'target')
+}
+
 function Launch-Zed {
-    $binary = Join-Path $RepoRoot 'target\debug\zed.exe'
+    $binary = Join-Path (Get-TargetDir) 'debug\zed.exe'
     if (-not (Test-Path $binary)) {
         Write-Error "$binary does not exist. Run '.\driver.ps1 build' first."
         exit $ExitLaunchFailed

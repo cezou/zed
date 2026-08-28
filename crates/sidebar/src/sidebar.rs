@@ -6,6 +6,7 @@ use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
+use agent_ui::terminal_thread_metadata_store::ClaudeActivity;
 use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
@@ -16,7 +17,6 @@ use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
     fuzzy_match_positions,
 };
-use agent_ui::terminal_thread_metadata_store::ClaudeActivity;
 use agent_ui::ticket_metadata_store::{
     self, TicketId, TicketMetadataStore, TicketSyncState, TicketWorktreeRecord,
 };
@@ -35,7 +35,8 @@ use feature_flags::{
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
     FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
+    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
+    linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -2384,9 +2385,7 @@ impl Sidebar {
 
         self.elapsed_ticker_task = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(1))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(1)).await;
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     return;
                 }
@@ -5025,6 +5024,11 @@ impl Sidebar {
             });
         };
 
+        // A ticket session lives in a pane of the workspace center, and the
+        // panel focuses that pane itself. Revealing the panel's dock here would
+        // pull the focus back out and take width from the session.
+        let lives_in_center = AgentPanel::terminal_belongs_to_a_ticket(metadata.terminal_id, cx);
+
         let mut existing_panel = None;
         workspace.update(cx, |workspace, cx| {
             if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
@@ -5034,13 +5038,15 @@ impl Sidebar {
 
         if let Some(agent_panel) = existing_panel {
             restore_terminal(agent_panel, metadata, focus, None, window, cx);
-            workspace.update(cx, |workspace, cx| {
-                if focus {
-                    workspace.focus_panel::<AgentPanel>(window, cx);
-                } else {
-                    workspace.reveal_panel::<AgentPanel>(window, cx);
-                }
-            });
+            if !lives_in_center {
+                workspace.update(cx, |workspace, cx| {
+                    if focus {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    } else {
+                        workspace.reveal_panel::<AgentPanel>(window, cx);
+                    }
+                });
+            }
             return;
         }
 
@@ -5056,10 +5062,12 @@ impl Sidebar {
                     panel.clone()
                 });
                 restore_terminal(panel, &metadata, focus, Some(workspace), window, cx);
-                if focus {
-                    workspace.focus_panel::<AgentPanel>(window, cx);
-                } else {
-                    workspace.reveal_panel::<AgentPanel>(window, cx);
+                if !lives_in_center {
+                    if focus {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    } else {
+                        workspace.reveal_panel::<AgentPanel>(window, cx);
+                    }
                 }
             })?;
 
@@ -8981,24 +8989,28 @@ impl Sidebar {
                     let ticket_id = ticket_id.clone();
                     let current = status.clone();
                     let options = options.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-                        for option in &options {
-                            let action = agent_ui::SetTicketStatus {
-                                ticket_id: ticket_id.0.to_string(),
-                                status: option.to_string(),
-                            };
-                            menu = menu.toggleable_entry(
-                                option.clone(),
-                                *option == current,
-                                IconPosition::End,
-                                None,
-                                move |window, cx| {
-                                    window.dispatch_action(action.boxed_clone(), cx);
-                                },
-                            );
-                        }
-                        menu
-                    }))
+                    Some(ContextMenu::build(
+                        window,
+                        cx,
+                        move |mut menu, _window, _cx| {
+                            for option in &options {
+                                let action = agent_ui::SetTicketStatus {
+                                    ticket_id: ticket_id.0.to_string(),
+                                    status: option.to_string(),
+                                };
+                                menu = menu.toggleable_entry(
+                                    option.clone(),
+                                    *option == current,
+                                    IconPosition::End,
+                                    None,
+                                    move |window, cx| {
+                                        window.dispatch_action(action.boxed_clone(), cx);
+                                    },
+                                );
+                            }
+                            menu
+                        },
+                    ))
                 },
             )
         })

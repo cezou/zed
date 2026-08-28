@@ -1128,6 +1128,9 @@
     "sidebar_side": "left",
     // Whether to show Zed's own agent threads in the threads sidebar.
     "show_zed_agent_threads": false,
+    // Which way an additional Claude Code session splits off the session it was
+    // launched from. Can be 'right', 'left', 'up' or 'down'.
+    "session_split_direction": "right",
     // Default width when the agent panel is docked to the left or right.
     "default_width": 640,
     // Default height when the agent panel is docked to the bottom.

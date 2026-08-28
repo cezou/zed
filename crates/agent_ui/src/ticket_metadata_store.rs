@@ -1636,6 +1636,25 @@ pub async fn open_ticket(
 /// Launches one more independent Claude Code session for a ticket that already
 /// has a worktree (and possibly other sessions running) — brief-driven, or a
 /// `claude --resume` adopting a session started outside Zed.
+/// Launches an additional session for a ticket by reusing the brief already on
+/// disk, so a split shortcut needs no modal and no further input.
+pub async fn split_additional_session(
+    ticket_id: TicketId,
+    fs: Arc<dyn Fs>,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    let spec = launch_spec_from_canonical(&fs, &ticket_id).await?;
+    launch_additional_session(
+        ticket_id,
+        TicketSessionStart::Brief(spec),
+        fs,
+        app_state,
+        cx,
+    )
+    .await
+}
+
 pub async fn launch_additional_session(
     ticket_id: TicketId,
     start: TicketSessionStart,

@@ -64,7 +64,9 @@ use prompt_store::{self, PromptBuilder, rules_to_skills_migration};
 use rope::Point;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelSelection, Settings as _, SettingsStore, SidebarSide};
+use settings::{
+    LanguageModelSelection, SessionSplitDirection, Settings as _, SettingsStore, SidebarSide,
+};
 use std::any::TypeId;
 use std::path::{Path, PathBuf};
 use workspace::{OpenOptions, Workspace};
@@ -366,6 +368,17 @@ pub struct StartTicketWork {
     /// Whether the ticket already has a worktree, in which case this launches
     /// one more session in it rather than cutting a new one.
     pub additional_session: bool,
+}
+
+/// Splits the focused Claude Code session, starting one more session for the
+/// same ticket in the new pane. Reuses the ticket's stored brief, so unlike the
+/// sidebar's "+" button it needs no modal.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = tickets)]
+#[serde(deny_unknown_fields)]
+pub struct SplitTicketSession {
+    /// Which way the new session opens: `right`, `left`, `up` or `down`.
+    pub direction: SessionSplitDirection,
 }
 
 /// Moves a Notion ticket to another status option.
@@ -708,6 +721,17 @@ pub fn init(
                 import_threads_from_other_channels(workspace, cx);
             },
         );
+        // Registered on the workspace rather than the panel: a session lives in
+        // a center pane, so the panel never holds the focus when the shortcut
+        // is pressed.
+        workspace.register_action(
+            |workspace: &mut Workspace,
+             action: &SplitTicketSession,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                AgentPanel::split_focused_ticket_session(workspace, action.direction, window, cx);
+            },
+        );
     })
     .detach();
 
@@ -1023,6 +1047,7 @@ mod tests {
             button: true,
             dock: DockPosition::Right,
             flexible: true,
+            session_split_direction: Default::default(),
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),

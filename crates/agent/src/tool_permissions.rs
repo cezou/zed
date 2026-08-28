@@ -572,6 +572,7 @@ mod tests {
             button: true,
             dock: DockPosition::Right,
             flexible: true,
+            session_split_direction: Default::default(),
             default_width: px(300.),
             default_height: px(600.),
             max_content_width: Some(px(850.)),

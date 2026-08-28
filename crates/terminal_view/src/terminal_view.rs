@@ -141,6 +141,9 @@ pub struct TerminalView {
     // Explicit override for whether workspace-specific context menu actions are shown.
     // When `None`, visibility is derived from `mode` (hidden for embedded terminals).
     show_workspace_actions: Option<bool>,
+    /// Set for a Claude Code session terminal, which adds a `TicketSession` key
+    /// context so the session split shortcuts can be bound to it alone.
+    is_ticket_session: bool,
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
@@ -291,6 +294,7 @@ impl TerminalView {
             hover_tooltip_update: Task::ready(()),
             mode: TerminalMode::Standalone,
             show_workspace_actions: None,
+            is_ticket_session: false,
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
@@ -327,6 +331,11 @@ impl TerminalView {
     /// visibility is derived from the terminal's `mode`.
     pub fn set_show_workspace_actions(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_workspace_actions = Some(show);
+        cx.notify();
+    }
+
+    pub fn set_is_ticket_session(&mut self, is_ticket_session: bool, cx: &mut Context<Self>) {
+        self.is_ticket_session = is_ticket_session;
         cx.notify();
     }
 
@@ -988,6 +997,10 @@ impl TerminalView {
     fn dispatch_context(&self, cx: &App) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
+
+        if self.is_ticket_session {
+            dispatch_context.add("TicketSession");
+        }
 
         if self.terminal.read(cx).vi_mode_enabled() {
             dispatch_context.add("vi_mode");
@@ -1892,6 +1905,13 @@ impl SerializableItem for TerminalView {
 
     fn should_serialize(&self, _: &Self::Event) -> bool {
         self.needs_serialize
+    }
+
+    /// A Claude Code session is restored by the agent panel, which respawns it
+    /// with `claude --resume` from its own records. Letting the workspace list
+    /// it too would rebuild it here as a bare shell alongside the real session.
+    fn included_in_workspace_serialization(&self, _cx: &App) -> bool {
+        !self.is_ticket_session
     }
 
     fn deserialize(

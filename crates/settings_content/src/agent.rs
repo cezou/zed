@@ -12,6 +12,31 @@ use crate::ExtendingVec;
 
 use crate::DockPosition;
 
+/// Which way an additional Claude Code session splits off the one it was
+/// launched from.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSplitDirection {
+    #[default]
+    Right,
+    Left,
+    Up,
+    Down,
+}
+
 /// Where to position the threads sidebar.
 #[derive(
     Clone,
@@ -218,6 +243,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub show_zed_agent_threads: Option<bool>,
+    /// Which way an additional Claude Code session splits off the session it
+    /// was launched from.
+    ///
+    /// Default: right
+    pub session_split_direction: Option<SessionSplitDirection>,
     /// Default width in pixels when the agent panel is docked to the left or right.
     ///
     /// Default: 640

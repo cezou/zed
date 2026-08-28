@@ -44,7 +44,7 @@ use crate::terminal_thread_metadata_store::{
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::ticket_metadata_store::{
-    TicketId, TicketLaunchFiles, TicketLaunchKind, TicketMetadataStore, TicketSessionRecord,
+    self, TicketId, TicketLaunchFiles, TicketLaunchKind, TicketMetadataStore, TicketSessionRecord,
     TicketTerminalLaunch,
 };
 use crate::{
@@ -78,7 +78,7 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
-    Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
+    Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
     PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
     pulsating_between,
 };
@@ -87,7 +87,7 @@ use language_model::LanguageModelRegistry;
 use notifications::status_toast::StatusToast;
 use project::{Project, ProjectPath, Worktree};
 use settings::TerminalDockPosition;
-use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
+use settings::{NotifyWhenAgentWaiting, SessionSplitDirection, Settings, update_settings_file};
 
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
 use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
@@ -101,10 +101,12 @@ use ui::{
 use util::ResultExt as _;
 use util::shell::ShellKind;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, Pane, PathList, SaveIntent,
+    SerializedPathList, SplitDirection, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView,
+    Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
+    pane::Event as PaneEvent,
 };
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
@@ -244,6 +246,15 @@ fn ticket_launch_command(
 /// Doubling as the marker that such a terminal is resumable at all (see
 /// [`terminal_resume_command`]) is why it is a constant rather than a literal.
 const CLAUDE_RESUME_COMMAND: &str = "claude --resume";
+
+fn split_direction_from_setting(direction: SessionSplitDirection) -> SplitDirection {
+    match direction {
+        SessionSplitDirection::Right => SplitDirection::Right,
+        SessionSplitDirection::Left => SplitDirection::Left,
+        SessionSplitDirection::Up => SplitDirection::Up,
+        SessionSplitDirection::Down => SplitDirection::Down,
+    }
+}
 
 /// What a ticket terminal is spawned with: the command typed into it, the
 /// `claude` session id to record (none when Claude's picker owns that choice),
@@ -1099,8 +1110,41 @@ pub(crate) struct AgentThread {
     conversation_view: Entity<ConversationView>,
 }
 
+/// Where a terminal's view is actually displayed. A ticket session lives in a
+/// pane of the workspace center so that it fills the frame and can be split;
+/// every other agent terminal is still rendered by the panel itself.
+enum TerminalHost {
+    Panel,
+    Center { pane: WeakEntity<Pane> },
+}
+
+impl TerminalHost {
+    fn center_pane(&self) -> Option<&WeakEntity<Pane>> {
+        match self {
+            TerminalHost::Panel => None,
+            TerminalHost::Center { pane } => Some(pane),
+        }
+    }
+
+    fn is_center(&self) -> bool {
+        matches!(self, TerminalHost::Center { .. })
+    }
+}
+
+/// Where `spawn_terminal` should put the view it creates.
+enum TerminalPlacement {
+    AgentPanel,
+    /// A pane of the workspace center. `split_from` names the session whose
+    /// pane should be split to make room, which is how an additional session
+    /// lands beside the one it was launched from instead of on top of it.
+    Center {
+        split_from: Option<(TerminalId, SplitDirection)>,
+    },
+}
+
 struct AgentTerminal {
     view: Entity<TerminalView>,
+    host: TerminalHost,
     title_editor: Option<Entity<Editor>>,
     title_editor_initial_title: Option<String>,
     title_editor_subscription: Option<Subscription>,
@@ -1113,6 +1157,9 @@ struct AgentTerminal {
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
+    /// Watches the pane a center session lives in. Held separately because it
+    /// has to be replaced when the tab is dragged to another pane.
+    pane_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     /// The command line typed into this terminal at spawn time, if any
     /// (see `spawn_terminal`'s `initial_command` parameter). Persisted so a
@@ -1322,6 +1369,11 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
+    /// Direction requested by a split shortcut, overriding
+    /// `agent.session_split_direction` for the one launch it started. Taken
+    /// rather than read, so a launch that never reaches `spawn_ticket_terminal`
+    /// cannot steer a later one.
+    pending_session_split_direction: Option<SplitDirection>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     _extension_subscription: Option<Subscription>,
@@ -1724,6 +1776,7 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
+            pending_session_split_direction: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
 
@@ -2136,6 +2189,7 @@ impl AgentPanel {
             true,
             true,
             source,
+            TerminalPlacement::AgentPanel,
             window,
             cx,
         );
@@ -2192,6 +2246,7 @@ impl AgentPanel {
         focus: bool,
         run_init_command: bool,
         source: AgentThreadSource,
+        placement: TerminalPlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2226,12 +2281,37 @@ impl AgentPanel {
             };
             this.update_in(cx, |this, window, cx| {
                 let terminal_for_init_command = terminal.clone();
+                let places_in_center = matches!(placement, TerminalPlacement::Center { .. });
                 let terminal_view = cx.new(|cx| {
-                    let mut view =
-                        TerminalView::new(terminal, workspace, workspace_id, project, window, cx);
-                    view.set_show_workspace_actions(false, cx);
+                    let mut view = TerminalView::new(
+                        terminal,
+                        workspace.clone(),
+                        workspace_id,
+                        project,
+                        window,
+                        cx,
+                    );
+                    // A center session keeps the workspace actions: they are what
+                    // put "Split Right/Left/Up/Down" in the context menu.
+                    if places_in_center {
+                        view.set_is_ticket_session(true, cx);
+                    } else {
+                        view.set_show_workspace_actions(false, cx);
+                    }
                     view
                 });
+                let host = match placement {
+                    TerminalPlacement::AgentPanel => TerminalHost::Panel,
+                    TerminalPlacement::Center { split_from } => this.place_terminal_in_center(
+                        &workspace,
+                        &terminal_view,
+                        split_from,
+                        select,
+                        focus,
+                        window,
+                        cx,
+                    ),
+                };
                 this.insert_terminal(
                     terminal_id,
                     terminal_view,
@@ -2244,6 +2324,7 @@ impl AgentPanel {
                     select,
                     focus,
                     source,
+                    host,
                     window,
                     cx,
                 );
@@ -2317,6 +2398,138 @@ impl AgentPanel {
         input
     }
 
+    /// Puts a session's view in a pane of the workspace center, so that it
+    /// fills the frame the center already owns instead of a dock. When
+    /// `split_from` names a live session, its pane is split so the new session
+    /// lands beside the one it was launched from rather than on top of it.
+    fn place_terminal_in_center(
+        &mut self,
+        workspace: &WeakEntity<Workspace>,
+        terminal_view: &Entity<TerminalView>,
+        split_from: Option<(TerminalId, SplitDirection)>,
+        select: bool,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TerminalHost {
+        let split_from = split_from.and_then(|(from_id, direction)| {
+            let from_view = self.terminals.get(&from_id)?.view.clone();
+            Some((from_view, direction))
+        });
+
+        let placed = workspace.update(cx, |workspace, cx| {
+            let pane = match split_from {
+                Some((from_view, direction)) => match workspace.pane_for(&from_view) {
+                    Some(from_pane) => workspace.split_pane(from_pane, direction, window, cx),
+                    None => Self::center_pane_for_session(workspace),
+                },
+                None => Self::center_pane_for_session(workspace),
+            };
+            // Don't steal focus from an open modal: the ticket launch modal
+            // dismisses itself only after the spawn it started has returned,
+            // and a shell can take tens of milliseconds to come up.
+            let focus_item = focus && !workspace.has_active_modal(window, cx);
+            workspace.add_item(
+                pane.clone(),
+                Box::new(terminal_view.clone()),
+                None,
+                select,
+                focus_item,
+                window,
+                cx,
+            );
+            pane
+        });
+
+        match placed {
+            Ok(pane) => TerminalHost::Center {
+                pane: pane.downgrade(),
+            },
+            Err(error) => {
+                log::error!("failed to place a session terminal in the center: {error:#}");
+                TerminalHost::Panel
+            }
+        }
+    }
+
+    /// Watches the pane holding a center session, so that closing its tab drops
+    /// the session instead of leaving an invisible pty running behind it.
+    fn subscribe_to_center_pane(
+        terminal_id: TerminalId,
+        view_id: EntityId,
+        pane: &WeakEntity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Subscription> {
+        let pane = pane.upgrade()?;
+        Some(cx.subscribe_in(
+            &pane,
+            window,
+            move |_this, _pane, event: &PaneEvent, window, cx| {
+                let PaneEvent::RemovedItem { item } = event else {
+                    return;
+                };
+                if item.item_id() != view_id {
+                    return;
+                }
+                // `RemovedItem` also fires when an item merely moves to another
+                // pane, so let that move land before calling the session gone.
+                cx.defer_in(window, move |this, window, cx| {
+                    this.resettle_center_terminal(terminal_id, window, cx);
+                });
+            },
+        ))
+    }
+
+    /// Runs once a center session's view has left its pane. A closed tab drops
+    /// the session — the `TicketSessionRecord` survives, so `claude --resume`
+    /// can pick it up later — while a tab dragged to another pane only
+    /// re-points the host at its new home.
+    fn resettle_center_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        if !terminal.host.is_center() {
+            return;
+        }
+        let view = terminal.view.clone();
+        let pane = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).pane_for(&view));
+        let Some(pane) = pane else {
+            self.detach_terminal(terminal_id, window, cx);
+            return;
+        };
+        let pane = pane.downgrade();
+        let subscription =
+            Self::subscribe_to_center_pane(terminal_id, view.entity_id(), &pane, window, cx);
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.host = TerminalHost::Center { pane };
+            terminal.pane_subscription = subscription;
+        }
+    }
+
+    /// The center pane a session should go into. `Workspace::active_pane` can
+    /// be a dock's pane, which would put the session straight back into a dock,
+    /// so fall back to the center's own first pane in that case.
+    fn center_pane_for_session(workspace: &Workspace) -> Entity<Pane> {
+        let active_pane = workspace.active_pane();
+        if workspace.panes().contains(active_pane) {
+            return active_pane.clone();
+        }
+        workspace
+            .panes()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| active_pane.clone())
+    }
+
     fn insert_terminal(
         &mut self,
         terminal_id: TerminalId,
@@ -2330,6 +2543,7 @@ impl AgentPanel {
         select: bool,
         focus: bool,
         source: AgentThreadSource,
+        host: TerminalHost,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2371,11 +2585,17 @@ impl AgentPanel {
             },
         );
 
+        let places_in_center = host.is_center();
+        let pane_subscription = host.center_pane().and_then(|pane| {
+            Self::subscribe_to_center_pane(terminal_id, terminal_view.entity_id(), pane, window, cx)
+        });
+
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
         let mut terminal = AgentTerminal {
             view: terminal_view,
+            host,
             title_editor: None,
             title_editor_initial_title: None,
             title_editor_subscription: None,
@@ -2391,6 +2611,7 @@ impl AgentPanel {
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
+            pane_subscription,
             _subscriptions: vec![view_subscription, terminal_subscription],
             initial_command,
             cc_session_id,
@@ -2404,7 +2625,10 @@ impl AgentPanel {
         self.persist_terminal_metadata(terminal_id, cx);
         self.emit_terminal_thread_started(terminal_id, source, cx);
         if select {
-            self.set_base_view(BaseView::Terminal { terminal_id }, focus, window, cx);
+            // A center session was already focused by the pane that took its
+            // view, so focusing the panel here would pull the focus back out.
+            let focus_panel = focus && !places_in_center;
+            self.set_base_view(BaseView::Terminal { terminal_id }, focus_panel, window, cx);
         }
         cx.emit(AgentPanelEvent::EntryChanged);
         cx.notify();
@@ -2425,11 +2649,46 @@ impl AgentPanel {
         if had_notification {
             self.dismiss_terminal_notifications(terminal_id, cx);
         }
-        self.set_base_view(BaseView::Terminal { terminal_id }, focus, window, cx);
+        // `base_view` still names the active session — the sidebar and the
+        // panel's title read it — but a center session is brought forward in
+        // its own pane, not by swapping the panel's surface.
+        self.set_base_view(BaseView::Terminal { terminal_id }, false, window, cx);
+        if !self.focus_center_terminal(terminal_id, focus, window, cx) && focus {
+            self.activation_focus_handle(cx).focus(window, cx);
+        }
         if had_notification {
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         }
+    }
+
+    /// Brings a center session forward in its pane. Returns `false` when the
+    /// terminal is not a center session, so the caller can fall back to
+    /// focusing the panel instead.
+    fn focus_center_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return false;
+        };
+        let Some(pane) = terminal.host.center_pane().and_then(|pane| pane.upgrade()) else {
+            return false;
+        };
+        let view_id = terminal.view.entity_id();
+        pane.update(cx, |pane, cx| {
+            let index = pane.items().position(|item| item.item_id() == view_id);
+            if let Some(index) = index {
+                pane.activate_item(index, focus, focus, window, cx);
+            }
+        });
+        if focus {
+            window.focus(&pane.focus_handle(cx), cx);
+        }
+        true
     }
 
     pub fn close_terminal(
@@ -2478,8 +2737,17 @@ impl AgentPanel {
             self.pending_terminal_spawn = None;
         }
         self.dismiss_terminal_notifications(terminal_id, cx);
-        if self.terminals.remove(&terminal_id).is_none() {
+        let Some(terminal) = self.terminals.remove(&terminal_id) else {
             return;
+        };
+        // A center session is owned by its pane, so dropping the registry entry
+        // is not enough: without this the tab survives as a dead item.
+        if let Some(pane) = terminal.host.center_pane().and_then(|pane| pane.upgrade()) {
+            let view_id = terminal.view.entity_id();
+            pane.update(cx, |pane, cx| {
+                pane.close_item_by_id(view_id, SaveIntent::Skip, window, cx)
+            })
+            .detach_and_log_err(cx);
         }
         if delete_metadata
             && let Some(store) = TerminalThreadMetadataStore::try_global(cx)
@@ -2611,6 +2879,15 @@ impl AgentPanel {
         // gets a resume command on respawn; a plain agent-panel terminal
         // restore continues to open a blank shell exactly as before.
         let resume_command = terminal_resume_command(&metadata);
+        // A ticket session goes back to the center it was launched in, so a
+        // restore after a restart rebuilds the same full-frame layout rather
+        // than dropping the session back into the panel's dock.
+        let placement = if Self::terminal_belongs_to_a_ticket(metadata.terminal_id, cx) {
+            TerminalPlacement::Center { split_from: None }
+        } else {
+            TerminalPlacement::AgentPanel
+        };
+        let restores_into_center = matches!(placement, TerminalPlacement::Center { .. });
         self.spawn_terminal(
             metadata.terminal_id,
             working_directory,
@@ -2623,9 +2900,19 @@ impl AgentPanel {
             focus,
             true,
             source,
+            placement,
             window,
             cx,
         );
+        if restores_into_center {
+            self.close_own_dock(window, cx);
+        }
+    }
+
+    /// Whether a terminal is one of a ticket's recorded Claude Code sessions.
+    pub fn terminal_belongs_to_a_ticket(terminal_id: TerminalId, cx: &App) -> bool {
+        TicketMetadataStore::try_global(cx)
+            .is_some_and(|store| store.read(cx).ticket_id_for_terminal(terminal_id).is_some())
     }
 
     fn restore_terminal_for_panel_load(
@@ -2710,6 +2997,15 @@ impl AgentPanel {
             .update(cx, |store, cx| store.add_session(&ticket_id, session, cx))
             .with_context(|| format!("failed to record a session for ticket {ticket_id:?}"))?;
 
+        // An additional session splits the ticket's live session instead of
+        // replacing it, so both stay on screen side by side.
+        let split_from = if launch_kind == TicketLaunchKind::Additional {
+            self.live_center_session_for_ticket(&ticket_id, cx)
+        } else {
+            None
+        };
+        let split_from = split_from.map(|from| (from, self.take_session_split_direction(cx)));
+
         self.spawn_terminal(
             terminal_id,
             Some(worktree_path),
@@ -2722,10 +3018,120 @@ impl AgentPanel {
             true,
             true,
             AgentThreadSource::TicketPanel,
+            TerminalPlacement::Center { split_from },
             window,
             cx,
         );
+        // The center now carries the session, so the panel's own dock would
+        // only take width away from it without showing anything.
+        self.close_own_dock(window, cx);
         Ok(())
+    }
+
+    /// The direction the next additional session splits in: whatever a split
+    /// shortcut asked for, else the configured default.
+    fn take_session_split_direction(&mut self, cx: &App) -> SplitDirection {
+        self.pending_session_split_direction
+            .take()
+            .unwrap_or_else(|| {
+                split_direction_from_setting(AgentSettings::get_global(cx).session_split_direction)
+            })
+    }
+
+    /// Records the direction a split shortcut asked for, then starts one more
+    /// session for the ticket owning the focused session.
+    pub fn split_focused_ticket_session(
+        workspace: &mut Workspace,
+        direction: SessionSplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+            return;
+        };
+        let Some(ticket_id) = panel
+            .read(cx)
+            .focused_center_session(workspace, window, cx)
+            .and_then(|terminal_id| {
+                let store = TicketMetadataStore::try_global(cx)?;
+                store.read(cx).ticket_id_for_terminal(terminal_id).cloned()
+            })
+        else {
+            return;
+        };
+
+        panel.update(cx, |panel, _cx| {
+            panel.pending_session_split_direction = Some(split_direction_from_setting(direction));
+        });
+
+        let fs = workspace.app_state().fs.clone();
+        let app_state = workspace.app_state().clone();
+        cx.spawn_in(window, async move |_workspace, cx| {
+            ticket_metadata_store::split_additional_session(ticket_id, fs, app_state, cx).await
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// The center session the user is currently in, if any: the active item of
+    /// the focused pane, resolved back to the session that owns it.
+    fn focused_center_session(
+        &self,
+        workspace: &Workspace,
+        window: &Window,
+        cx: &App,
+    ) -> Option<TerminalId> {
+        let pane = workspace.focused_pane(window, cx);
+        let item_id = pane.read(cx).active_item()?.item_id();
+        self.terminals
+            .iter()
+            .find(|(_, terminal)| terminal.host.is_center() && terminal.view.entity_id() == item_id)
+            .map(|(terminal_id, _)| *terminal_id)
+    }
+
+    /// The ticket's most recently active session that is still live in this
+    /// window's center, which is the one an additional session splits off.
+    fn live_center_session_for_ticket(&self, ticket_id: &TicketId, cx: &App) -> Option<TerminalId> {
+        let store = TicketMetadataStore::try_global(cx)?;
+        let store = store.read(cx);
+        let entry = store.entry(ticket_id)?;
+        entry
+            .sessions
+            .iter()
+            .filter(|session| session.ended_at.is_none())
+            .filter(|session| {
+                self.terminals
+                    .get(&session.terminal_id)
+                    .is_some_and(|terminal| {
+                        terminal
+                            .host
+                            .center_pane()
+                            .is_some_and(|pane| pane.upgrade().is_some())
+                    })
+            })
+            .max_by_key(|session| session.last_resumed_at.unwrap_or(session.created_at))
+            .map(|session| session.terminal_id)
+    }
+
+    /// Closes the dock this panel sits in. Used when a session moves into the
+    /// center: the panel has nothing left to show there, and its dock is
+    /// flexible, so leaving it open would eat most of the frame.
+    ///
+    /// Deferred on purpose: a restore driven from the sidebar reaches this from
+    /// inside `Workspace::update`, and updating the workspace again from there
+    /// panics on a double lease.
+    fn close_own_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let position = self.position(window, cx);
+        let workspace = self.workspace.clone();
+        cx.defer_in(window, move |_this, window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .dock_at_position(position)
+                    .update(cx, |dock, cx| dock.set_open(false, window, cx));
+            });
+        });
     }
 
     fn edit_terminal_title(
@@ -3085,7 +3491,7 @@ impl AgentPanel {
         if !window.is_window_active() {
             return false;
         }
-        if !self.terminal_surface_visible(terminal_id) {
+        if !self.terminal_surface_visible(terminal_id, cx) {
             return false;
         }
         let Some(workspace) = self.workspace.upgrade() else {
@@ -3097,12 +3503,46 @@ impl AgentPanel {
                 return false;
             }
         }
-        AgentPanel::is_visible(&workspace, cx)
+        true
     }
 
-    fn terminal_surface_visible(&self, terminal_id: TerminalId) -> bool {
-        self.active_terminal_id() == Some(terminal_id)
-            && matches!(self.visible_surface(), VisibleSurface::Terminal(_))
+    /// Whether this terminal's surface is actually on screen. The container
+    /// differs per host: the panel's dock for a panel terminal, its own pane
+    /// for a center session — so a session must not be judged by whether the
+    /// dock is open, or every one of its bells would ring with the dock closed.
+    fn terminal_surface_visible(&self, terminal_id: TerminalId, cx: &App) -> bool {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return false;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        match &terminal.host {
+            TerminalHost::Panel => {
+                self.active_terminal_id() == Some(terminal_id)
+                    && matches!(self.visible_surface(), VisibleSurface::Terminal(_))
+                    && AgentPanel::is_visible(&workspace, cx)
+            }
+            TerminalHost::Center { pane } => {
+                let Some(pane) = pane.upgrade() else {
+                    return false;
+                };
+                let view_id = terminal.view.entity_id();
+                let is_active_item = pane
+                    .read(cx)
+                    .active_item()
+                    .is_some_and(|item| item.item_id() == view_id);
+                // A zoomed view covers every pane but the one holding it, so a
+                // session outside it is off screen even though its pane still
+                // has it as the active item.
+                let zoomed_elsewhere = workspace
+                    .read(cx)
+                    .zoomed_item()
+                    .and_then(|zoomed| zoomed.upgrade())
+                    .is_some_and(|zoomed| zoomed.entity_id() != view_id);
+                is_active_item && !zoomed_elsewhere
+            }
+        }
     }
 
     fn terminal_status_visible(&self, terminal_id: TerminalId, window: &Window, cx: &App) -> bool {
@@ -3121,13 +3561,10 @@ impl AgentPanel {
             };
 
             return multi_workspace.workspace() == &workspace
-                && self.terminal_surface_visible(terminal_id)
-                && AgentPanel::is_visible(&workspace, cx);
+                && self.terminal_surface_visible(terminal_id, cx);
         }
 
-        self.workspace.upgrade().is_some_and(|workspace| {
-            self.terminal_surface_visible(terminal_id) && AgentPanel::is_visible(&workspace, cx)
-        })
+        self.terminal_surface_visible(terminal_id, cx)
     }
 
     fn dismiss_terminal_pop_up_if_visible(
@@ -4554,9 +4991,13 @@ impl AgentPanel {
             BaseView::AgentThread { conversation_view } => {
                 VisibleSurface::AgentThread(conversation_view)
             }
+            // A center session is rendered by its pane, never by the panel:
+            // rendering the same view twice in one frame would fight over
+            // focus and element ids.
             BaseView::Terminal { terminal_id } => self
                 .terminals
                 .get(terminal_id)
+                .filter(|terminal| !terminal.host.is_center())
                 .map(|terminal| VisibleSurface::Terminal(&terminal.view))
                 .unwrap_or(VisibleSurface::Uninitialized),
         }
@@ -5394,6 +5835,7 @@ impl AgentPanel {
             false,
             true,
             source,
+            TerminalPlacement::AgentPanel,
             window,
             cx,
         );
@@ -5418,6 +5860,7 @@ impl AgentPanel {
             false,
             true,
             source,
+            TerminalPlacement::AgentPanel,
             window,
             cx,
         ) {
@@ -6945,6 +7388,7 @@ impl AgentPanel {
             focus,
             true,
             AgentThreadSource::AgentPanel,
+            TerminalPlacement::AgentPanel,
             window,
             cx,
         )?;
@@ -6982,6 +7426,7 @@ impl AgentPanel {
             focus,
             true,
             source,
+            TerminalPlacement::AgentPanel,
             window,
             cx,
         )
@@ -6999,6 +7444,7 @@ impl AgentPanel {
         focus: bool,
         run_init_command: bool,
         source: AgentThreadSource,
+        placement: TerminalPlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
@@ -7015,6 +7461,7 @@ impl AgentPanel {
         );
         let terminal = cx.new(|cx| builder.subscribe(cx));
         let terminal_for_init_command = terminal.clone();
+        let places_in_center = matches!(placement, TerminalPlacement::Center { .. });
         let terminal_view = cx.new(|cx| {
             let mut view = TerminalView::new(
                 terminal,
@@ -7024,9 +7471,28 @@ impl AgentPanel {
                 window,
                 cx,
             );
-            view.set_show_workspace_actions(false, cx);
+            if places_in_center {
+                view.set_is_ticket_session(true, cx);
+            } else {
+                view.set_show_workspace_actions(false, cx);
+            }
             view
         });
+        let host = match placement {
+            TerminalPlacement::AgentPanel => TerminalHost::Panel,
+            TerminalPlacement::Center { split_from } => {
+                let workspace = self.workspace.clone();
+                self.place_terminal_in_center(
+                    &workspace,
+                    &terminal_view,
+                    split_from,
+                    select,
+                    focus,
+                    window,
+                    cx,
+                )
+            }
+        };
         self.insert_terminal(
             terminal_id,
             terminal_view,
@@ -7039,6 +7505,7 @@ impl AgentPanel {
             select,
             focus,
             source,
+            host,
             window,
             cx,
         );
@@ -7970,6 +8437,153 @@ mod tests {
         });
     }
 
+    /// Puts a session terminal in the workspace center. Display-only, because a
+    /// real pty drives work from its own I/O thread, which the test scheduler
+    /// rejects as non-deterministic.
+    fn place_center_terminal(
+        panel: &Entity<AgentPanel>,
+        split_from: Option<(TerminalId, SplitDirection)>,
+        cx: &mut VisualTestContext,
+    ) -> TerminalId {
+        let terminal_id = TerminalId::new();
+        panel
+            .update_in(cx, |panel, window, cx| {
+                panel.insert_display_only_terminal(
+                    terminal_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                    AgentThreadSource::TicketPanel,
+                    TerminalPlacement::Center { split_from },
+                    window,
+                    cx,
+                )
+            })
+            .expect("a display-only session terminal should be insertable");
+        cx.run_until_parked();
+        terminal_id
+    }
+
+    fn center_pane_count(panel: &Entity<AgentPanel>, cx: &mut VisualTestContext) -> usize {
+        let workspace = panel
+            .read_with(cx, |panel, _cx| panel.workspace.clone())
+            .upgrade()
+            .expect("the test workspace should be alive");
+        workspace.read_with(cx, |workspace, _cx| workspace.panes().len())
+    }
+
+    #[gpui::test]
+    async fn test_center_placement_hands_the_view_to_a_center_pane(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = place_center_terminal(&panel, None, &mut cx);
+
+        let view_id = panel.read_with(&cx, |panel, _cx| {
+            let terminal = panel
+                .terminals
+                .get(&terminal_id)
+                .expect("the session should be registered");
+            assert!(
+                terminal.host.is_center(),
+                "a center placement should record a center host"
+            );
+            assert!(
+                matches!(panel.visible_surface(), VisibleSurface::Uninitialized),
+                "a center session is rendered by its pane, so the panel must not \
+                 render it a second time"
+            );
+            terminal.view.entity_id()
+        });
+
+        let workspace = panel
+            .read_with(&cx, |panel, _cx| panel.workspace.clone())
+            .upgrade()
+            .expect("the test workspace should be alive");
+        workspace.read_with(&cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .panes()
+                    .iter()
+                    .any(|pane| { pane.read(cx).items().any(|item| item.item_id() == view_id) }),
+                "the session's view should be an item of a center pane"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_an_additional_center_session_splits_instead_of_stacking(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        let first = place_center_terminal(&panel, None, &mut cx);
+        let panes_after_first = center_pane_count(&panel, &mut cx);
+
+        let second = place_center_terminal(&panel, Some((first, SplitDirection::Right)), &mut cx);
+
+        assert_eq!(
+            center_pane_count(&panel, &mut cx),
+            panes_after_first + 1,
+            "an additional session should open a new pane rather than share the first one"
+        );
+
+        panel.read_with(&cx, |panel, cx| {
+            let first_pane = panel.terminals[&first]
+                .host
+                .center_pane()
+                .and_then(|pane| pane.upgrade())
+                .expect("the first session should still have its pane");
+            let second_pane = panel.terminals[&second]
+                .host
+                .center_pane()
+                .and_then(|pane| pane.upgrade())
+                .expect("the second session should have a pane");
+            assert_ne!(
+                first_pane.entity_id(),
+                second_pane.entity_id(),
+                "the two sessions should sit in different panes"
+            );
+            assert_eq!(
+                first_pane.read(cx).items().count(),
+                1,
+                "splitting must not move the first session out of its own pane"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_closing_a_center_session_keeps_it_out_of_the_registry(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = place_center_terminal(&panel, None, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal(terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                !panel.terminals.contains_key(&terminal_id),
+                "closing a session should drop it from the registry"
+            );
+            let workspace = panel
+                .workspace
+                .upgrade()
+                .expect("the test workspace should be alive");
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .panes()
+                    .iter()
+                    .map(|pane| pane.read(cx).items().count())
+                    .sum::<usize>(),
+                0,
+                "closing a session should take its tab with it"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_restored_terminal_runs_init_command_once(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -8084,6 +8698,7 @@ mod tests {
                 true,
                 true,
                 AgentThreadSource::AgentPanel,
+                TerminalPlacement::AgentPanel,
                 window,
                 cx,
             );
@@ -9587,6 +10202,7 @@ mod tests {
                     true,
                     false,
                     AgentThreadSource::AgentPanel,
+                    TerminalPlacement::AgentPanel,
                     window,
                     cx,
                 )

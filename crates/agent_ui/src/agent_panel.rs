@@ -37,10 +37,12 @@ use zed_actions::{
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::agent_waiting_notifications::{self, SessionNotificationTarget};
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    ClaudeActivity, TerminalThreadMetadata, TerminalThreadMetadataStore, claude_activity,
-    claude_task_summary, compose_terminal_thread_title, terminal_title_without_prefix,
+    CLAUDE_EXCERPT_LINES, ClaudeActivity, TerminalThreadMetadata, TerminalThreadMetadataStore,
+    claude_activity, claude_response_excerpt, claude_task_summary, compose_terminal_thread_title,
+    terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::ticket_metadata_store::{
@@ -1099,6 +1101,16 @@ pub(crate) struct AgentThread {
     conversation_view: Entity<ConversationView>,
 }
 
+/// What a metadata refresh found, beyond "something changed": a turn that just
+/// ended has to be reported separately, because it is the one transition the
+/// panel acts on rather than merely redraws.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetadataRefresh {
+    changed: bool,
+    /// Claude Code went from working to waiting on the user.
+    finished_turn: bool,
+}
+
 struct AgentTerminal {
     view: Entity<TerminalView>,
     title_editor: Option<Entity<Editor>>,
@@ -1202,27 +1214,31 @@ impl AgentTerminal {
     /// Decodes Claude Code's state out of the terminal title, stamping the
     /// instant of every transition so the UI can show how long the current
     /// turn has been running.
-    fn refresh_claude_activity(&mut self, cx: &App) -> bool {
+    fn refresh_claude_activity(&mut self, cx: &App) -> MetadataRefresh {
         let title = self.terminal_title(cx);
         let activity = claude_activity(title.as_ref());
         let task = claude_task_summary(title.as_ref()).map(SharedString::from);
 
-        let mut changed = false;
+        let mut refresh = MetadataRefresh::default();
         if self.claude_activity != activity {
+            // Only a turn that was seen running can have finished: a session
+            // opens on `Unknown`, and reaches `Idle` before its first prompt.
+            refresh.finished_turn =
+                self.claude_activity == ClaudeActivity::Working && activity == ClaudeActivity::Idle;
             self.claude_activity = activity;
             self.claude_activity_since = Utc::now();
-            changed = true;
+            refresh.changed = true;
         }
         if task.is_some() && self.claude_task != task {
             self.claude_task = task;
-            changed = true;
+            refresh.changed = true;
         }
-        changed
+        refresh
     }
 
-    fn refresh_metadata(&mut self, cx: &mut App) -> bool {
+    fn refresh_metadata(&mut self, cx: &mut App) -> MetadataRefresh {
         let title_changed = self.refresh_title(cx);
-        let activity_changed = self.refresh_claude_activity(cx);
+        let mut refresh = self.refresh_claude_activity(cx);
         let current_working_directory = self.view.read(cx).terminal().read(cx).working_directory();
         let working_directory_changed = current_working_directory
             .as_ref()
@@ -1230,7 +1246,8 @@ impl AgentTerminal {
         if working_directory_changed {
             self.working_directory = current_working_directory;
         }
-        title_changed || working_directory_changed || activity_changed
+        refresh.changed |= title_changed || working_directory_changed;
+        refresh
     }
 
     fn custom_title(&self, cx: &App) -> Option<SharedString> {
@@ -2339,11 +2356,12 @@ impl AgentPanel {
             });
         }
         let terminal_entity = terminal_view.read(cx).terminal().clone();
-        let view_subscription = cx.subscribe(
+        let view_subscription = cx.subscribe_in(
             &terminal_view,
-            move |this, _terminal_view, event: &ItemEvent, cx| match event {
+            window,
+            move |this, _terminal_view, event: &ItemEvent, window, cx| match event {
                 ItemEvent::UpdateTab | ItemEvent::UpdateBreadcrumbs => {
-                    this.refresh_terminal_metadata(terminal_id, cx);
+                    this.refresh_terminal_metadata(terminal_id, window, cx);
                 }
                 ItemEvent::CloseItem | ItemEvent::Edit => {}
             },
@@ -2357,7 +2375,7 @@ impl AgentPanel {
                 TerminalEvent::TitleChanged
                 | TerminalEvent::Wakeup
                 | TerminalEvent::BreadcrumbsChanged => {
-                    this.refresh_terminal_metadata(terminal_id, cx);
+                    this.refresh_terminal_metadata(terminal_id, window, cx);
                     this.report_terminal_program(terminal_id, source, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
@@ -2481,9 +2499,7 @@ impl AgentPanel {
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
-        if delete_metadata
-            && let Some(store) = TerminalThreadMetadataStore::try_global(cx)
-        {
+        if delete_metadata && let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.delete(terminal_id, cx);
             });
@@ -2526,13 +2542,23 @@ impl AgentPanel {
         );
     }
 
-    fn refresh_terminal_metadata(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.terminals.get_mut(&terminal_id)
-            && terminal.refresh_metadata(cx)
-        {
+    fn refresh_terminal_metadata(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        let refresh = terminal.refresh_metadata(cx);
+        if refresh.changed {
             self.persist_terminal_metadata(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
+        }
+        if refresh.finished_turn {
+            self.notify_claude_session_waiting(terminal_id, window, cx);
         }
     }
 
@@ -2860,6 +2886,102 @@ impl AgentPanel {
         }
     }
 
+    /// Posts a system notification for a session that just stopped working.
+    ///
+    /// Separate from the bell-driven [`Self::mark_terminal_notification`]
+    /// because it fires on Claude Code's own end-of-turn transition, which is
+    /// the signal that actually arrives: a turn can end without the terminal
+    /// bell ever ringing. It also fires on every end of turn, where the bell
+    /// path deliberately only fires on the first one, since each turn ending is
+    /// a fresh answer for the user to read.
+    fn notify_claude_session_waiting(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_terminal_visible(terminal_id, window, cx) {
+            return;
+        }
+        // `PrimaryScreen` and `AllScreens` both notify: the notification center
+        // places a system notification itself, so only `Never` is actionable.
+        if AgentSettings::get_global(cx).notify_when_agent_waiting == NotifyWhenAgentWaiting::Never
+        {
+            return;
+        }
+        let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+            log::error!("root view should be a MultiWorkspace");
+            return;
+        };
+        let Some((title, body)) = self.claude_session_notification_content(terminal_id, cx) else {
+            return;
+        };
+
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id)
+            && !terminal.has_notification
+        {
+            terminal.has_notification = true;
+            cx.emit(AgentPanelEvent::EntryChanged);
+            cx.notify();
+        }
+        #[cfg(feature = "audio")]
+        self.play_terminal_notification_sound(
+            self.terminal_status_visible(terminal_id, window, cx),
+            cx,
+        );
+        agent_waiting_notifications::show(
+            SessionNotificationTarget {
+                window: window_handle,
+                workspace: self.workspace.clone(),
+                terminal_id,
+            },
+            title,
+            body,
+            cx,
+        );
+    }
+
+    /// What a waiting session's notification should say: which ticket it
+    /// belongs to, and what Claude last answered.
+    fn claude_session_notification_content(
+        &self,
+        terminal_id: TerminalId,
+        cx: &App,
+    ) -> Option<(SharedString, SharedString)> {
+        let terminal = self.terminals.get(&terminal_id)?;
+
+        let ticket = TicketMetadataStore::try_global(cx).and_then(|store| {
+            let store = store.read(cx);
+            let record = store.entry(store.ticket_id_for_terminal(terminal_id)?)?;
+            Some(match record.issue_id.as_ref() {
+                Some(issue_id) => SharedString::from(format!("{issue_id} · {}", record.title)),
+                None => record.title.clone(),
+            })
+        });
+        // A `claude` terminal the user started by hand belongs to no ticket.
+        let title = ticket.unwrap_or_else(|| terminal.title(cx));
+
+        let excerpt = claude_response_excerpt(
+            &terminal
+                .view
+                .read(cx)
+                .terminal()
+                .read(cx)
+                .last_n_non_empty_lines(CLAUDE_EXCERPT_LINES),
+        );
+        // The task summary names the turn, the excerpt says how it ended; with
+        // several sessions on one ticket the summary is also what tells them
+        // apart in the notification center.
+        let body = match (terminal.claude_task.as_ref(), excerpt) {
+            (Some(task), Some(excerpt)) => format!("{task} — {excerpt}").into(),
+            (Some(task), None) => task.clone(),
+            (None, Some(excerpt)) => SharedString::from(excerpt),
+            (None, None) => SharedString::from("Waiting for input"),
+        };
+
+        Some((title, body))
+    }
+
     fn mark_terminal_notification(
         &mut self,
         terminal_id: TerminalId,
@@ -2957,36 +3079,21 @@ impl AgentPanel {
         let event_subscription = cx.subscribe_in(&pop_up, window, {
             move |this, _, event: &AgentNotificationEvent, window, cx| match event {
                 AgentNotificationEvent::Accepted => {
-                    let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+                    let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>()
+                    else {
                         log::error!("root view should be a MultiWorkspace");
                         return;
                     };
-                    cx.activate(true);
-
-                    let workspace = this.workspace.clone();
+                    let target = SessionNotificationTarget {
+                        window: window_handle,
+                        workspace: this.workspace.clone(),
+                        terminal_id,
+                    };
+                    // Deferred: this handler runs inside the pop-up window's own
+                    // update, which cannot update another window in turn.
                     cx.defer(move |cx| {
-                        handle
-                            .update(cx, |multi_workspace, window, cx| {
-                                window.activate_window();
-
-                                let Some(workspace) = workspace.upgrade() else {
-                                    return;
-                                };
-                                multi_workspace.activate(workspace.clone(), None, window, cx);
-
-                                workspace.update(cx, |workspace, cx| {
-                                    workspace.reveal_panel::<AgentPanel>(window, cx);
-                                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                                        panel.update(cx, |panel, cx| {
-                                            panel.activate_terminal(terminal_id, true, window, cx);
-                                        });
-                                    }
-                                    workspace.focus_panel::<AgentPanel>(window, cx);
-                                });
-                            })
-                            .log_err();
+                        agent_waiting_notifications::activate_session(target, cx);
                     });
-
                     this.dismiss_terminal_notifications(terminal_id, cx);
                 }
                 AgentNotificationEvent::Dismissed => {
@@ -3044,6 +3151,7 @@ impl AgentPanel {
     }
 
     fn dismiss_terminal_notifications(&mut self, terminal_id: TerminalId, cx: &mut App) {
+        agent_waiting_notifications::dismiss(terminal_id, cx);
         let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
             return;
         };
@@ -3145,6 +3253,7 @@ impl AgentPanel {
             && terminal.has_notification
         {
             terminal.has_notification = false;
+            agent_waiting_notifications::dismiss(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         }
@@ -4530,6 +4639,7 @@ impl AgentPanel {
                                 if let Some(terminal) = this.terminals.get_mut(&terminal_id) {
                                     terminal.has_notification = false;
                                 }
+                                agent_waiting_notifications::dismiss(terminal_id, cx);
                                 cx.emit(AgentPanelEvent::ActiveViewFocused);
                                 cx.notify();
                             }),
@@ -7046,6 +7156,28 @@ impl AgentPanel {
         Ok(())
     }
 
+    /// Feeds bytes to a display-only terminal as if its program had written
+    /// them, so a test can drive the title escape sequences Claude Code uses to
+    /// report its state, and the output the panel reads back from the screen.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn write_test_terminal_output(
+        &mut self,
+        terminal_id: TerminalId,
+        output: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal_entity) = self
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.view.read(cx).terminal().clone())
+        else {
+            return;
+        };
+        terminal_entity.update(cx, |terminal, cx| {
+            terminal.write_output(output.as_bytes(), cx);
+        });
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn emit_test_terminal_bell(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
         let Some(terminal_entity) = self
@@ -7087,6 +7219,7 @@ mod tests {
     use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus};
     use action_log::ActionLog;
     use anyhow::{Result, anyhow};
+    use gpui::SystemNotificationResponse;
 
     #[test]
     fn test_single_line_prompt() {
@@ -10258,8 +10391,8 @@ mod tests {
             assert!(terminal.title_editor.is_none());
         });
 
-        panel.update(&mut cx, |panel, cx| {
-            panel.refresh_terminal_metadata(terminal_id, cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.refresh_terminal_metadata(terminal_id, window, cx);
         });
         cx.run_until_parked();
 
@@ -10645,6 +10778,125 @@ mod tests {
             cx.windows()
                 .iter()
                 .all(|window| window.downcast::<AgentNotification>().is_none())
+        );
+    }
+
+    /// Sets the terminal title the way Claude Code does, with an OSC 0 escape
+    /// sequence: `\u{25d0}` is a spinner frame (a turn is running) and
+    /// `\u{2733}` the resting glyph (waiting on the user).
+    fn claude_title(glyph: char, task: &str) -> String {
+        format!("\u{1b}]0;{glyph} {task}\u{7}")
+    }
+
+    #[gpui::test]
+    async fn test_finished_claude_turn_notifies_and_activates_on_click(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.update(|_window, cx| {
+            // `main` does this at startup; without an identity the platform has
+            // no notifier to post through.
+            cx.set_app_identity("dev.zed.Zed-Test", "Zed Test");
+            crate::agent_waiting_notifications::init(cx);
+        });
+
+        let waiting_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Session A", true, window, cx)
+            })
+            .expect("first test terminal should be inserted");
+        let active_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Session B", true, window, cx)
+            })
+            .expect("second test terminal should be inserted");
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(panel.active_terminal_id(), Some(active_terminal_id));
+        });
+
+        // A turn running in the session the user is not looking at.
+        panel.update(&mut cx, |panel, cx| {
+            panel.write_test_terminal_output(
+                waiting_terminal_id,
+                &format!(
+                    "{}\u{23fa} The fix is in place.\r\n",
+                    claude_title('\u{25d0}', "Fix the panel")
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.cx.shown_system_notifications().is_empty(),
+            "a running turn is not something to notify about"
+        );
+
+        // The same session, once the turn is over.
+        panel.update(&mut cx, |panel, cx| {
+            panel.write_test_terminal_output(
+                waiting_terminal_id,
+                &claude_title('\u{2733}', "Fix the panel"),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let notifications = cx.cx.shown_system_notifications();
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        let notification = &notifications[0];
+        assert!(!notification.title.is_empty());
+        assert_eq!(notification.body, "Fix the panel — The fix is in place.");
+
+        cx.cx
+            .simulate_system_notification_response(SystemNotificationResponse {
+                tag: notification.tag.clone(),
+                action_id: None,
+            });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.active_terminal_id(),
+                Some(waiting_terminal_id),
+                "clicking the notification should focus the session that posted it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_finished_claude_turn_in_the_visible_session_is_not_notified(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        // Set so that a missing notification proves the panel suppressed it,
+        // not that the platform had no notifier to post through.
+        cx.update(|_window, cx| cx.set_app_identity("dev.zed.Zed-Test", "Zed Test"));
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Session", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.write_test_terminal_output(
+                terminal_id,
+                &format!(
+                    "{}\u{23fa} Done.\r\n",
+                    claude_title('\u{25d0}', "Fix the panel")
+                ),
+                cx,
+            );
+            panel.write_test_terminal_output(
+                terminal_id,
+                &claude_title('\u{2733}', "Fix the panel"),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.cx.shown_system_notifications().is_empty(),
+            "the session the user is already reading needs no notification"
         );
     }
 

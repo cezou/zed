@@ -3244,13 +3244,17 @@ impl AgentPanel {
     /// center: the panel has nothing left to show there, and its dock is
     /// flexible, so leaving it open would eat most of the frame.
     ///
-    /// Deferred on purpose: a restore driven from the sidebar reaches this from
-    /// inside `Workspace::update`, and updating the workspace again from there
-    /// panics on a double lease.
+    /// Deferred, and deferred *without* leasing this panel: closing a dock
+    /// deactivates the panel inside it, which re-enters `set_active` on this
+    /// very panel. `Context::defer_in` runs its callback inside a lease on the
+    /// panel, so that second update panics on a double lease, while
+    /// `Window::defer` hands out only the window and the app. Deferring at all
+    /// is also what keeps a restore driven from the sidebar, which arrives from
+    /// inside `Workspace::update`, from updating the workspace re-entrantly.
     fn close_own_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let position = self.position(window, cx);
         let workspace = self.workspace.clone();
-        cx.defer_in(window, move |_this, window, cx| {
+        window.defer(cx, move |window, cx| {
             let Some(workspace) = workspace.upgrade() else {
                 return;
             };
@@ -15036,5 +15040,64 @@ mod tests {
                 "selected_agent should be restored to the original after an agent override"
             );
         });
+    }
+
+    /// Closing the panel's own dock deactivates the panel, which re-enters
+    /// `set_active` on it. Deferring through `Context::defer_in` leased the
+    /// panel for the callback, so that second update panicked on a double
+    /// lease — the crash seen when a ticket session was restored into the
+    /// center at startup.
+    #[gpui::test]
+    async fn test_closing_own_dock_from_inside_a_panel_update(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentPanel>(window, cx);
+            panel
+        });
+
+        let dock_position = panel.update_in(cx, |panel, window, cx| panel.position(window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .dock_at_position(dock_position)
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+        });
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .dock_at_position(dock_position)
+                .read(cx)
+                .is_open()),
+            "the panel's dock has to start open for the test to mean anything"
+        );
+
+        // Both real callers reach this from inside an update of the panel.
+        panel.update_in(cx, |panel, window, cx| panel.close_own_dock(window, cx));
+        cx.run_until_parked();
+
+        assert!(
+            !workspace.read_with(cx, |workspace, cx| workspace
+                .dock_at_position(dock_position)
+                .read(cx)
+                .is_open()),
+            "closing the panel's own dock leaves it closed"
+        );
     }
 }

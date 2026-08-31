@@ -54,7 +54,9 @@ use smol::future::poll_once;
 use std::{
     cell::RefCell,
     env,
-    io::{self, IsTerminal},
+    fs::OpenOptions,
+    io::{self, IsTerminal, Write as _},
+    panic,
     path::{Path, PathBuf},
     process,
     rc::Rc,
@@ -154,6 +156,10 @@ fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncApp) {
 }
 
 fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
+    // This path exits the process, and an `eprintln!` alone leaves nothing in
+    // `Zed.log` — including for a GPU failure, the likeliest cause of an error
+    // reaching here.
+    log::error!("Zed failed to open a window: {e:?}");
     eprintln!(
         "Zed failed to open a window: {e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
     );
@@ -195,6 +201,57 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
         .detach();
     }
 }
+
+/// Records panics in `zed-panic.log`, beside `Zed.log`.
+///
+/// On a dev-channel build neither existing path puts a panic on disk: the
+/// native crash handler is disabled, so `crashes::force_backtrace` leaves the
+/// default hook writing to stderr, and a launch from a terminal sends zlog to
+/// stdout rather than to the log file. A separate file also survives the 1 MiB
+/// rotation of `Zed.log`, which a crash loop would otherwise churn through.
+///
+/// `crashes::force_backtrace` and `crashes::init` both chain onto the hook they
+/// find, so this one keeps running when either installs itself later.
+fn init_panic_logging(app_version: String, app_commit_sha: String) {
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let current_thread = std::thread::current();
+        let thread_name = current_thread.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
+        let message = info.payload_as_str().unwrap_or("Box<Any>");
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        log::error!("thread '{thread_name}' panicked at {location}:\n{message}\n{backtrace}");
+
+        let report = format!(
+            "\n===== {timestamp} zed {app_version}, sha {app_commit_sha}, channel {channel}, pid {pid} =====\n\
+             thread '{thread_name}' panicked at {location}:\n{message}\n{backtrace}\n",
+            timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
+            channel = release_channel::RELEASE_CHANNEL_NAME.as_str(),
+            pid = process::id(),
+        );
+
+        // Writing the report must never turn a panic into a double panic, so
+        // each failure here is logged and dropped.
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths::logs_dir().join("zed-panic.log"))
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(report.as_bytes()) {
+                    log::error!("Failed to write the panic report: {error}");
+                }
+            }
+            Err(error) => log::error!("Failed to open zed-panic.log: {error}"),
+        }
+
+        previous_hook(info);
+    }));
+}
+
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
@@ -312,6 +369,15 @@ fn main() {
     let app_commit_sha =
         option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha::new(commit_sha.to_string()));
     let app_version = AppVersion::load(env!("CARGO_PKG_VERSION"), version, app_commit_sha.clone());
+    // Installed before the rest of the boot runs, so a panic anywhere past this
+    // point lands on disk.
+    init_panic_logging(
+        app_version.to_string(),
+        app_commit_sha
+            .as_ref()
+            .map(|sha| sha.short())
+            .unwrap_or_else(|| "unknown".to_owned()),
+    );
 
     if args.system_specs {
         let system_specs = system_specs::SystemSpecs::new_stateless(
@@ -341,6 +407,29 @@ fn main() {
             .as_deref()
             .unwrap_or("unknown"),
     );
+    // A startup crash on another machine has to be diagnosable from this file
+    // alone, so the header carries what `--system-specs` would have reported.
+    // The pid matters too: the dev channel skips the single-instance check, so
+    // several instances interleave their lines in one log.
+    log::info!(
+        "[boot] pid {}, {}",
+        process::id(),
+        system_specs::SystemSpecs::new_stateless(
+            app_version.clone(),
+            app_commit_sha.clone(),
+            *release_channel::RELEASE_CHANNEL,
+            client::telemetry::os_name(),
+            client::telemetry::os_version(),
+        )
+        .to_string()
+        .replace('\n', " | "),
+    );
+    log::info!(
+        "[boot] data dir {:?}, log file {:?}, logging to stdout: {}",
+        paths::data_dir(),
+        paths::log_file(),
+        stdout_is_a_pty(),
+    );
 
     #[cfg(windows)]
     check_for_conpty_dll();
@@ -348,8 +437,18 @@ fn main() {
     let app = build_application()
         .with_assets(Assets)
         .with_restart_arguments(restart_arguments);
+    log::info!("[boot] platform built");
 
     let app_db = db::AppDatabase::new();
+    log::info!(
+        "[boot] app database opened at {:?}",
+        db::db_path(paths::database_dir(), *release_channel::RELEASE_CHANNEL),
+    );
+    if db::ALL_FILE_DB_FAILED.load(std::sync::atomic::Ordering::Acquire) {
+        log::warn!(
+            "[boot] the file-backed database could not be opened, so this run uses an in-memory one and persists nothing"
+        );
+    }
     let system_id = app.background_executor().spawn(system_id());
     let installation_id = app
         .background_executor()
@@ -389,6 +488,7 @@ fn main() {
         return;
     }
 
+    log::info!("[boot] single-instance check done");
     let should_install_crash_handler =
         client::telemetry::should_install_crash_handler(*release_channel::RELEASE_CHANNEL);
 
@@ -483,6 +583,7 @@ fn main() {
     });
 
     app.run(move |cx| {
+        log::info!("[boot] entered the application loop");
         cx.set_global(app_db);
         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
             Ok(trusted_paths) => trusted_paths,
@@ -510,6 +611,7 @@ fn main() {
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
+        log::info!("[boot] settings and keymap initialized");
 
         let user_agent = format!(
             "Zed/{} ({}; {})",
@@ -883,6 +985,7 @@ fn main() {
         }
 
         initialize_workspace(app_state.clone(), cx);
+        log::info!("[boot] workspace initialized");
 
         cx.activate(true);
 
@@ -1433,6 +1536,7 @@ pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    log::info!("[boot] restoring or creating the workspace");
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
     if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
         let mut error_count = 0;
